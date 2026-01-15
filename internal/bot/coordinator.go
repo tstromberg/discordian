@@ -7,14 +7,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/codeGROOVE-dev/discordian/internal/dailyreport"
+	"github.com/codeGROOVE-dev/discordian/internal/discord"
 	"github.com/codeGROOVE-dev/discordian/internal/format"
 	"github.com/codeGROOVE-dev/discordian/internal/state"
 	"github.com/google/uuid"
 )
 
 const (
-	eventDeduplicationTTL = time.Hour
-	maxConcurrentEvents   = 10
+	eventDeduplicationTTL  = time.Hour
+	maxConcurrentEvents    = 10
+	pollOpenPRHours        = 24                     // Look back 24 hours for open PRs
+	pollClosedPRHours      = 1                      // Look back 1 hour for closed PRs
+	crossInstanceRaceDelay = 100 * time.Millisecond // Delay before creating to allow cross-instance race detection
 )
 
 // Coordinator orchestrates event processing for a GitHub organization.
@@ -24,9 +29,12 @@ type Coordinator struct {
 	store      StateStore
 	turn       TurnClient
 	userMapper UserMapper
+	searcher   PRSearcher
 	logger     *slog.Logger
 	eventSem   chan struct{}
 	tagTracker *tagTracker
+	prLocks    sync.Map // PR URL -> *sync.Mutex (serializes channel operations per PR)
+	dmLocks    sync.Map // userID:prURL -> *sync.Mutex (serializes DM operations per user+PR)
 	org        string
 	wg         sync.WaitGroup
 }
@@ -38,6 +46,7 @@ type CoordinatorConfig struct {
 	Store      StateStore
 	Turn       TurnClient
 	UserMapper UserMapper
+	Searcher   PRSearcher
 	Logger     *slog.Logger
 	Org        string
 }
@@ -56,6 +65,7 @@ func NewCoordinator(cfg CoordinatorConfig) *Coordinator {
 		store:      cfg.Store,
 		turn:       cfg.Turn,
 		userMapper: cfg.UserMapper,
+		searcher:   cfg.Searcher,
 		logger:     logger.With("org", cfg.Org),
 		eventSem:   make(chan struct{}, maxConcurrentEvents),
 		tagTracker: newTagTracker(),
@@ -87,10 +97,11 @@ func (c *Coordinator) ProcessEvent(ctx context.Context, event SprinklerEvent) {
 
 func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent) error {
 	// Parse PR URL
-	owner, repo, number, ok := ParsePRURL(event.URL)
+	prInfo, ok := ParsePRURL(event.URL)
 	if !ok {
 		return fmt.Errorf("invalid PR URL: %s", event.URL)
 	}
+	owner, repo, number := prInfo.Owner, prInfo.Repo, prInfo.Number
 
 	// Auto-reload config when .codeGROOVE repo is updated
 	if repo == ".codeGROOVE" {
@@ -101,12 +112,17 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 		return nil // Don't post notifications for config repo PRs
 	}
 
-	// Deduplicate
+	// Deduplicate by delivery ID
 	eventKey := fmt.Sprintf("%s:%s", event.DeliveryID, event.URL)
 	if c.store.WasProcessed(ctx, eventKey) {
 		c.logger.Debug("skipping duplicate event", "delivery_id", event.DeliveryID)
 		return nil
 	}
+
+	// Lock per PR URL to prevent race conditions (duplicate threads/messages)
+	prLock := c.getPRLock(event.URL)
+	prLock.Lock()
+	defer prLock.Unlock()
 
 	c.logger.Info("processing event",
 		"type", event.Type,
@@ -126,15 +142,19 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 		checkResp = &CheckResponse{}
 	}
 
-	// Determine state
-	prState := format.StateFromAnalysis(
-		checkResp.PullRequest.Merged,
-		checkResp.PullRequest.Closed,
-		checkResp.PullRequest.Draft,
-		checkResp.Analysis.WorkflowState,
-		checkResp.Analysis.Checks.Failing,
-		checkResp.Analysis.MergeConflict,
-	)
+	// Determine state using same logic as slacker
+	prState := format.StateFromAnalysis(format.StateAnalysisParams{
+		Merged:             checkResp.PullRequest.Merged,
+		Closed:             checkResp.PullRequest.Closed,
+		Draft:              checkResp.PullRequest.Draft,
+		MergeConflict:      checkResp.Analysis.MergeConflict,
+		Approved:           checkResp.Analysis.Approved,
+		ChecksFailing:      checkResp.Analysis.Checks.Failing,
+		ChecksPending:      checkResp.Analysis.Checks.Pending,
+		ChecksWaiting:      checkResp.Analysis.Checks.Waiting,
+		UnresolvedComments: checkResp.Analysis.UnresolvedComments,
+		WorkflowState:      checkResp.Analysis.WorkflowState,
+	})
 
 	// Build action users
 	actionUsers := c.buildActionUsers(ctx, checkResp)
@@ -171,19 +191,37 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 func (c *Coordinator) buildActionUsers(ctx context.Context, checkResp *CheckResponse) []format.ActionUser {
 	var users []format.ActionUser
 
+	c.logger.Debug("building action users",
+		"next_action_count", len(checkResp.Analysis.NextAction),
+		"next_action", checkResp.Analysis.NextAction)
+
 	for username, action := range checkResp.Analysis.NextAction {
+		// Skip _system pseudo-user - these are system-level actions without a human assignee
+		if username == "_system" {
+			c.logger.Debug("skipping _system action", "action", action.Kind)
+			continue
+		}
+
 		mention := username
 		if c.userMapper != nil {
 			mention = c.userMapper.Mention(ctx, username)
 		}
 
+		actionLabel := format.ActionLabel(action.Kind)
+		c.logger.Debug("adding action user",
+			"username", username,
+			"mention", mention,
+			"raw_action", action.Kind,
+			"action_label", actionLabel)
+
 		users = append(users, format.ActionUser{
 			Username: username,
 			Mention:  mention,
-			Action:   format.ActionLabel(action.Action),
+			Action:   actionLabel,
 		})
 	}
 
+	c.logger.Debug("built action users", "count", len(users))
 	return users
 }
 
@@ -221,6 +259,7 @@ func (c *Coordinator) processChannel(
 		State:       prState,
 		ActionUsers: actionUsers,
 		PRURL:       prURL,
+		ChannelName: channelName,
 	}
 
 	// Check for existing thread/message
@@ -247,6 +286,15 @@ func (c *Coordinator) processForumChannel(
 	content := format.ForumThreadContent(params)
 
 	if exists && threadInfo.ThreadID != "" {
+		// Content comparison: skip update if content unchanged
+		if threadInfo.MessageText == content {
+			c.logger.Debug("forum post unchanged, skipping update",
+				"thread_id", threadInfo.ThreadID,
+				"pr", params.PRURL)
+			c.trackTaggedUsers(params)
+			return nil
+		}
+
 		// Update existing thread
 		err := c.discord.UpdateForumPost(ctx, threadInfo.ThreadID, threadInfo.MessageID, title, content)
 		if err == nil {
@@ -267,7 +315,38 @@ func (c *Coordinator) processForumChannel(
 			c.trackTaggedUsers(params)
 			return nil
 		}
-		c.logger.Warn("failed to update forum post, creating new", "error", err)
+		c.logger.Warn("failed to update forum post, will search/create", "error", err)
+	}
+
+	// Cross-instance race prevention: sleep then search before creating
+	time.Sleep(crossInstanceRaceDelay)
+
+	// Search for existing thread created by another instance
+	if foundThreadID, foundMsgID, found := c.discord.FindForumThread(ctx, channelID, params.PRURL); found {
+		c.logger.Info("found existing forum thread from another instance",
+			"thread_id", foundThreadID,
+			"pr", params.PRURL)
+
+		// Save the found thread and update it
+		newInfo := state.ThreadInfo{
+			ThreadID:    foundThreadID,
+			MessageID:   foundMsgID,
+			ChannelID:   channelID,
+			ChannelType: "forum",
+			LastState:   string(params.State),
+			MessageText: content,
+		}
+		if err := c.store.SaveThread(ctx, owner, repo, number, channelID, newInfo); err != nil {
+			c.logger.Warn("failed to save found thread info", "error", err)
+		}
+
+		// Update the found thread with current content
+		if err := c.discord.UpdateForumPost(ctx, foundThreadID, foundMsgID, title, content); err != nil {
+			c.logger.Warn("failed to update found forum post", "error", err)
+		}
+
+		c.trackTaggedUsers(params)
+		return nil
 	}
 
 	// Create new forum thread
@@ -305,6 +384,15 @@ func (c *Coordinator) processTextChannel(
 	content := format.ChannelMessage(params)
 
 	if exists && threadInfo.MessageID != "" {
+		// Content comparison: skip update if content unchanged
+		if threadInfo.MessageText == content {
+			c.logger.Debug("channel message unchanged, skipping update",
+				"message_id", threadInfo.MessageID,
+				"pr", params.PRURL)
+			c.trackTaggedUsers(params)
+			return nil
+		}
+
 		// Update existing message
 		err := c.discord.UpdateMessage(ctx, channelID, threadInfo.MessageID, content)
 		if err == nil {
@@ -317,7 +405,37 @@ func (c *Coordinator) processTextChannel(
 			c.trackTaggedUsers(params)
 			return nil
 		}
-		c.logger.Warn("failed to update message, creating new", "error", err)
+		c.logger.Warn("failed to update message, will search/create", "error", err)
+	}
+
+	// Cross-instance race prevention: sleep then search before creating
+	time.Sleep(crossInstanceRaceDelay)
+
+	// Search for existing message created by another instance
+	if foundMsgID, found := c.discord.FindChannelMessage(ctx, channelID, params.PRURL); found {
+		c.logger.Info("found existing channel message from another instance",
+			"message_id", foundMsgID,
+			"pr", params.PRURL)
+
+		// Save the found message and update it
+		newInfo := state.ThreadInfo{
+			MessageID:   foundMsgID,
+			ChannelID:   channelID,
+			ChannelType: "text",
+			LastState:   string(params.State),
+			MessageText: content,
+		}
+		if err := c.store.SaveThread(ctx, owner, repo, number, channelID, newInfo); err != nil {
+			c.logger.Warn("failed to save found message info", "error", err)
+		}
+
+		// Update the found message with current content
+		if err := c.discord.UpdateMessage(ctx, channelID, foundMsgID, content); err != nil {
+			c.logger.Warn("failed to update found message", "error", err)
+		}
+
+		c.trackTaggedUsers(params)
+		return nil
 	}
 
 	// Create new message
@@ -360,87 +478,302 @@ func (c *Coordinator) queueDMNotifications(
 	prState format.PRState,
 	_ []format.ActionUser,
 ) {
-	// Skip DMs for merged/closed PRs
+	prURL := FormatPRURL(owner, repo, number)
+
+	// For merged/closed PRs, update ALL previous DM recipients
 	if prState == format.StateMerged || prState == format.StateClosed {
+		c.updateAllDMsForClosedPR(ctx, owner, repo, number, checkResp, prState, prURL)
 		return
 	}
 
-	prURL := FormatPRURL(owner, repo, number)
-
+	// For active PRs, process each user who has a next action
 	for username, action := range checkResp.Analysis.NextAction {
-		// Get Discord ID
-		var discordID string
-		if c.userMapper != nil {
-			discordID = c.userMapper.DiscordID(ctx, username)
-		}
-		if discordID == "" {
-			c.logger.Debug("skipping DM - no Discord mapping",
-				"github_user", username)
-			continue
-		}
+		c.processDMForUser(ctx, owner, repo, number, checkResp, prState, prURL, username, action.Kind)
+	}
+}
 
-		// Check if user is in guild
-		if !c.discord.IsUserInGuild(ctx, discordID) {
-			c.logger.Debug("skipping DM - user not in guild",
-				"github_user", username,
-				"discord_id", discordID)
-			continue
-		}
+// processDMForUser handles DM notification for a single user.
+// Uses per-user-PR locking to prevent duplicate DMs.
+func (c *Coordinator) processDMForUser(
+	ctx context.Context,
+	owner, repo string,
+	number int,
+	checkResp *CheckResponse,
+	prState format.PRState,
+	prURL string,
+	username string,
+	actionKind string,
+) {
+	// Get Discord ID
+	var discordID string
+	if c.userMapper != nil {
+		discordID = c.userMapper.DiscordID(ctx, username)
+	}
+	if discordID == "" {
+		c.logger.Debug("skipping DM - no Discord mapping",
+			"github_user", username)
+		return
+	}
 
-		// Get delay from config (any channel will do, use first one found)
-		channels := c.config.ChannelsForRepo(c.org, repo)
-		delay := 65 // default
-		if len(channels) > 0 {
-			delay = c.config.ReminderDMDelay(c.org, channels[0])
-		}
+	// Lock per user+PR to prevent concurrent duplicate DMs
+	dmLock := c.getDMLock(discordID, prURL)
+	dmLock.Lock()
+	defer dmLock.Unlock()
 
-		if delay == 0 {
-			c.logger.Debug("skipping DM - notifications disabled",
-				"github_user", username,
-				"repo", repo)
-			continue
-		}
+	// Check if user is in guild
+	if !c.discord.IsUserInGuild(ctx, discordID) {
+		c.logger.Debug("skipping DM - user not in guild",
+			"github_user", username,
+			"discord_id", discordID)
+		return
+	}
 
-		// Build DM message
-		params := format.ChannelMessageParams{
-			Owner:  owner,
-			Repo:   repo,
-			Number: number,
-			Title:  checkResp.PullRequest.Title,
-			Author: checkResp.PullRequest.Author,
-			State:  prState,
-			PRURL:  prURL,
-		}
-		message := format.DMMessage(params, format.ActionLabel(action.Action))
+	// Build DM message
+	params := format.ChannelMessageParams{
+		Owner:  owner,
+		Repo:   repo,
+		Number: number,
+		Title:  checkResp.PullRequest.Title,
+		Author: checkResp.PullRequest.Author,
+		State:  prState,
+		PRURL:  prURL,
+	}
+	newMessage := format.DMMessage(params, format.ActionLabel(actionKind))
 
-		// Calculate send time
-		sendAt := time.Now()
-		if c.tagTracker.wasTagged(prURL, username) {
-			// User was tagged in channel, delay DM
-			sendAt = sendAt.Add(time.Duration(delay) * time.Minute)
+	// Check for existing queued DMs for this user+PR
+	pendingDMs, err := c.store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
+	if err != nil {
+		c.logger.Warn("failed to check pending DMs", "error", err)
+	}
+	var existingPending *state.PendingDM
+	for _, dm := range pendingDMs {
+		if dm.UserID == discordID && dm.PRURL == prURL {
+			existingPending = dm
+			break
 		}
-		// If not tagged, send immediately (sendAt is now)
+	}
 
-		// Queue the DM
-		dm := &state.PendingDM{
-			ID:          uuid.New().String(),
-			UserID:      discordID,
-			PRURL:       prURL,
-			MessageText: message,
-			SendAt:      sendAt,
-			GuildID:     c.discord.GuildID(),
-			Org:         c.org,
-		}
-
-		if err := c.store.QueuePendingDM(ctx, dm); err != nil {
-			c.logger.Warn("failed to queue DM",
-				"error", err,
-				"user", username)
-		} else {
-			c.logger.Debug("queued DM notification",
+	// If there's a queued DM, update or cancel it based on state
+	if existingPending != nil {
+		if existingPending.MessageText == newMessage {
+			// State unchanged, keep existing queued DM
+			c.logger.Debug("DM already queued with same state",
 				"user", username,
-				"discord_id", discordID,
-				"send_at", sendAt)
+				"pr_url", prURL)
+			return
+		}
+		// State changed - remove old queued DM and queue new one
+		if err := c.store.RemovePendingDM(ctx, existingPending.ID); err != nil {
+			c.logger.Warn("failed to remove old pending DM", "error", err)
+		}
+		c.logger.Debug("updating queued DM with new state",
+			"user", username,
+			"pr_url", prURL)
+	}
+
+	// Check for existing sent DM in store
+	dmInfo, dmExists := c.store.DMInfo(ctx, discordID, prURL)
+
+	// If no stored DM info, search DM history as fallback (handles restarts)
+	if !dmExists {
+		if foundChannelID, foundMsgID, found := c.discord.FindDMForPR(ctx, discordID, prURL); found {
+			c.logger.Info("found existing DM in history",
+				"user_id", discordID,
+				"pr_url", prURL)
+			dmInfo = state.DMInfo{
+				ChannelID: foundChannelID,
+				MessageID: foundMsgID,
+			}
+			dmExists = true
+			// Note: we don't know the LastState, so we'll update it
+		}
+	}
+
+	// Idempotency: skip if state unchanged
+	if dmExists && dmInfo.LastState == string(prState) {
+		c.logger.Debug("DM skipped - state unchanged",
+			"user", username,
+			"pr_url", prURL,
+			"state", prState)
+		return
+	}
+
+	// If we have an existing DM, update it immediately
+	if dmExists && dmInfo.ChannelID != "" && dmInfo.MessageID != "" {
+		// Content comparison: skip if message unchanged
+		if dmInfo.MessageText == newMessage {
+			c.logger.Debug("DM content unchanged, skipping update",
+				"user", username,
+				"pr_url", prURL)
+			return
+		}
+
+		if err := c.discord.UpdateDM(ctx, dmInfo.ChannelID, dmInfo.MessageID, newMessage); err != nil {
+			c.logger.Warn("failed to update DM",
+				"error", err,
+				"user_id", discordID,
+				"pr_url", prURL)
+			// Fall through to potentially queue new DM
+		} else {
+			// Save updated DM info
+			dmInfo.MessageText = newMessage
+			dmInfo.LastState = string(prState)
+			dmInfo.SentAt = time.Now()
+			if err := c.store.SaveDMInfo(ctx, discordID, prURL, dmInfo); err != nil {
+				c.logger.Warn("failed to save updated DM info", "error", err)
+			}
+			c.logger.Info("updated DM notification",
+				"user_id", discordID,
+				"github_user", username,
+				"pr_url", prURL,
+				"state", prState)
+			return
+		}
+	}
+
+	// New DM - check delay configuration
+	channels := c.config.ChannelsForRepo(c.org, repo)
+	delay := 65 // default
+	if len(channels) > 0 {
+		delay = c.config.ReminderDMDelay(c.org, channels[0])
+	}
+
+	if delay == 0 {
+		c.logger.Debug("skipping DM - notifications disabled",
+			"github_user", username,
+			"repo", repo)
+		return
+	}
+
+	// Calculate send time
+	sendAt := time.Now()
+	if c.tagTracker.wasTagged(prURL, username) {
+		// User was tagged in channel, delay DM
+		sendAt = sendAt.Add(time.Duration(delay) * time.Minute)
+	}
+
+	// Queue the DM
+	dm := &state.PendingDM{
+		ID:          uuid.New().String(),
+		UserID:      discordID,
+		PRURL:       prURL,
+		MessageText: newMessage,
+		SendAt:      sendAt,
+		GuildID:     c.discord.GuildID(),
+		Org:         c.org,
+	}
+
+	if err := c.store.QueuePendingDM(ctx, dm); err != nil {
+		c.logger.Warn("failed to queue DM",
+			"error", err,
+			"user", username)
+	} else {
+		c.logger.Debug("queued DM notification",
+			"user", username,
+			"discord_id", discordID,
+			"send_at", sendAt)
+	}
+}
+
+// updateAllDMsForClosedPR updates DMs for all users who received notifications about this PR.
+// This ensures users see the final merged/closed state.
+func (c *Coordinator) updateAllDMsForClosedPR(
+	ctx context.Context,
+	owner, repo string,
+	number int,
+	checkResp *CheckResponse,
+	prState format.PRState,
+	prURL string,
+) {
+	// Get all users who received DMs for this PR
+	userIDs := c.store.ListDMUsers(ctx, prURL)
+	if len(userIDs) == 0 {
+		c.logger.Debug("no DM recipients found for closed PR",
+			"pr_url", prURL,
+			"state", prState)
+		// Also cancel any pending DMs
+		c.cancelPendingDMsForPR(ctx, prURL)
+		return
+	}
+
+	c.logger.Info("updating DMs for closed/merged PR",
+		"pr_url", prURL,
+		"state", prState,
+		"recipient_count", len(userIDs))
+
+	// Build the final message (no action since PR is closed)
+	params := format.ChannelMessageParams{
+		Owner:  owner,
+		Repo:   repo,
+		Number: number,
+		Title:  checkResp.PullRequest.Title,
+		Author: checkResp.PullRequest.Author,
+		State:  prState,
+		PRURL:  prURL,
+	}
+	finalMessage := format.DMMessage(params, "") // No action for closed PRs
+
+	// Update each user's DM
+	for _, discordID := range userIDs {
+		// Lock per user+PR
+		dmLock := c.getDMLock(discordID, prURL)
+		dmLock.Lock()
+
+		dmInfo, exists := c.store.DMInfo(ctx, discordID, prURL)
+		if exists && dmInfo.ChannelID != "" && dmInfo.MessageID != "" {
+			// Idempotency check
+			if dmInfo.LastState == string(prState) {
+				dmLock.Unlock()
+				continue
+			}
+
+			if err := c.discord.UpdateDM(ctx, dmInfo.ChannelID, dmInfo.MessageID, finalMessage); err != nil {
+				c.logger.Warn("failed to update DM for closed PR",
+					"error", err,
+					"user_id", discordID,
+					"pr_url", prURL)
+			} else {
+				dmInfo.MessageText = finalMessage
+				dmInfo.LastState = string(prState)
+				dmInfo.SentAt = time.Now()
+				if err := c.store.SaveDMInfo(ctx, discordID, prURL, dmInfo); err != nil {
+					c.logger.Warn("failed to save DM info", "error", err)
+				}
+				c.logger.Debug("updated DM for closed PR",
+					"user_id", discordID,
+					"pr_url", prURL,
+					"state", prState)
+			}
+		}
+
+		dmLock.Unlock()
+	}
+
+	// Cancel any pending DMs for this PR
+	c.cancelPendingDMsForPR(ctx, prURL)
+}
+
+// cancelPendingDMsForPR removes all queued DMs for a PR.
+func (c *Coordinator) cancelPendingDMsForPR(ctx context.Context, prURL string) {
+	pendingDMs, err := c.store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
+	if err != nil {
+		c.logger.Warn("failed to get pending DMs for cancellation", "error", err)
+		return
+	}
+
+	for _, dm := range pendingDMs {
+		if dm.PRURL == prURL {
+			if err := c.store.RemovePendingDM(ctx, dm.ID); err != nil {
+				c.logger.Warn("failed to cancel pending DM",
+					"dm_id", dm.ID,
+					"pr_url", prURL,
+					"error", err)
+			} else {
+				c.logger.Debug("cancelled pending DM for closed PR",
+					"dm_id", dm.ID,
+					"user_id", dm.UserID,
+					"pr_url", prURL)
+			}
 		}
 	}
 }
@@ -448,6 +781,31 @@ func (c *Coordinator) queueDMNotifications(
 // Wait waits for all pending event processing to complete.
 func (c *Coordinator) Wait() {
 	c.wg.Wait()
+}
+
+// getPRLock returns a mutex for serializing operations on a specific PR.
+func (c *Coordinator) getPRLock(prURL string) *sync.Mutex {
+	lock, _ := c.prLocks.LoadOrStore(prURL, &sync.Mutex{})
+	mu, ok := lock.(*sync.Mutex)
+	if !ok {
+		// Should never happen since we always store *sync.Mutex
+		mu = &sync.Mutex{}
+		c.prLocks.Store(prURL, mu)
+	}
+	return mu
+}
+
+// getDMLock returns a mutex for serializing DM operations for a specific user+PR.
+// This prevents duplicate DMs when concurrent events trigger notifications for the same user.
+func (c *Coordinator) getDMLock(userID, prURL string) *sync.Mutex {
+	key := userID + ":" + prURL
+	lock, _ := c.dmLocks.LoadOrStore(key, &sync.Mutex{})
+	mu, ok := lock.(*sync.Mutex)
+	if !ok {
+		mu = &sync.Mutex{}
+		c.dmLocks.Store(key, mu)
+	}
+	return mu
 }
 
 // tagTracker tracks which users were tagged in channel messages.
@@ -480,4 +838,263 @@ func (t *tagTracker) wasTagged(prURL, username string) bool {
 		return false
 	}
 	return t.tagged[prURL][username]
+}
+
+// PollAndReconcile queries GitHub for PRs and reconciles their state.
+// This serves as a backup mechanism when sprinkler events are missed.
+func (c *Coordinator) PollAndReconcile(ctx context.Context) {
+	if c.searcher == nil {
+		c.logger.Debug("skipping poll - no PR searcher configured")
+		return
+	}
+
+	c.logger.Info("starting PR poll and reconcile")
+
+	// Poll open PRs (updated in last 24 hours)
+	openPRs, err := c.searcher.ListOpenPRs(ctx, c.org, pollOpenPRHours)
+	if err != nil {
+		c.logger.Error("failed to list open PRs", "error", err)
+	} else {
+		c.logger.Debug("found open PRs to reconcile", "count", len(openPRs))
+		for _, pr := range openPRs {
+			c.reconcilePR(ctx, pr)
+		}
+	}
+
+	// Poll closed PRs (closed in last hour) to catch terminal states
+	closedPRs, err := c.searcher.ListClosedPRs(ctx, c.org, pollClosedPRHours)
+	if err != nil {
+		c.logger.Error("failed to list closed PRs", "error", err)
+	} else {
+		c.logger.Debug("found closed PRs to reconcile", "count", len(closedPRs))
+		for _, pr := range closedPRs {
+			c.reconcilePR(ctx, pr)
+		}
+	}
+
+	c.logger.Info("PR poll and reconcile complete",
+		"open_prs", len(openPRs),
+		"closed_prs", len(closedPRs))
+
+	// Check and send daily reports after reconciliation
+	c.checkDailyReports(ctx, openPRs)
+}
+
+// reconcilePR checks a single PR's state and updates Discord if needed.
+func (c *Coordinator) reconcilePR(ctx context.Context, pr PRSearchResult) {
+	// Create a synthetic event for processing
+	event := SprinklerEvent{
+		Type:       "poll",
+		URL:        pr.URL,
+		Timestamp:  pr.UpdatedAt,
+		DeliveryID: fmt.Sprintf("poll-%s-%d", pr.URL, time.Now().UnixNano()),
+	}
+
+	// Use a unique event key for polling to avoid dedup conflicts with real events
+	// but still prevent duplicate poll processing
+	pollKey := fmt.Sprintf("poll:%s:%s", pr.URL, pr.UpdatedAt.Format(time.RFC3339))
+	if c.store.WasProcessed(ctx, pollKey) {
+		return // Already processed this PR at this update time
+	}
+
+	// Process the event (reuses all the normal event processing logic)
+	if err := c.processEventSync(ctx, event); err != nil {
+		c.logger.Warn("failed to reconcile PR",
+			"url", pr.URL,
+			"error", err)
+		return
+	}
+
+	// Mark as processed
+	if err := c.store.MarkProcessed(ctx, pollKey, eventDeduplicationTTL); err != nil {
+		c.logger.Warn("failed to mark poll processed", "error", err)
+	}
+}
+
+// checkDailyReports checks if daily reports should be sent to users.
+func (c *Coordinator) checkDailyReports(ctx context.Context, prs []PRSearchResult) {
+	if len(prs) == 0 {
+		c.logger.Debug("skipping daily reports - no PRs found")
+		return
+	}
+
+	// Create daily report sender
+	sender := dailyreport.NewSender(c.store, c.logger)
+
+	// Load config to check if daily reports are disabled
+	cfg, exists := c.config.Config(c.org)
+	if !exists {
+		c.logger.Debug("skipping daily reports - no config found")
+		return
+	}
+
+	// Register Discord client as DM sender
+	guildID := cfg.Global.GuildID
+	if guildID == "" {
+		c.logger.Debug("skipping daily reports - no guild ID in config")
+		return
+	}
+	sender.RegisterGuild(guildID, c.discord)
+
+	// Extract unique GitHub users from PRs
+	userMap := make(map[string]bool)
+	for _, pr := range prs {
+		// For each PR, we'll need to check Turn API to see which users have actions
+		// For now, just collect PR authors as a starting point
+		if _, ok := ParsePRURL(pr.URL); !ok {
+			continue
+		}
+
+		// Call Turn API to get next actions for this PR
+		checkResp, err := c.turn.Check(ctx, pr.URL, "", pr.UpdatedAt)
+		if err != nil {
+			c.logger.Debug("failed to check PR for daily report",
+				"pr_url", pr.URL,
+				"error", err)
+			continue
+		}
+
+		// Add all users with next actions
+		for username := range checkResp.Analysis.NextAction {
+			if username != "_system" {
+				userMap[username] = true
+			}
+		}
+
+		// Also add PR author for outgoing PRs
+		if checkResp.PullRequest.Author != "" {
+			userMap[checkResp.PullRequest.Author] = true
+		}
+	}
+
+	c.logger.Debug("checking daily reports for users",
+		"user_count", len(userMap),
+		"pr_count", len(prs))
+
+	// Check each user for daily report eligibility
+	for githubUsername := range userMap {
+		c.checkUserDailyReport(ctx, sender, githubUsername, guildID, prs)
+	}
+}
+
+// checkUserDailyReport checks and sends a daily report for a specific user.
+func (c *Coordinator) checkUserDailyReport(
+	ctx context.Context,
+	sender *dailyreport.Sender,
+	githubUsername string,
+	guildID string,
+	prs []PRSearchResult,
+) {
+	// Get Discord ID for this GitHub user
+	discordID := ""
+	if c.userMapper != nil {
+		discordID = c.userMapper.DiscordID(ctx, githubUsername)
+	}
+	if discordID == "" {
+		c.logger.Debug("skipping daily report - no Discord mapping",
+			"github_user", githubUsername)
+		return
+	}
+
+	// Check if user is in guild
+	if !c.discord.IsUserInGuild(ctx, discordID) {
+		c.logger.Debug("skipping daily report - user not in guild",
+			"github_user", githubUsername,
+			"discord_id", discordID)
+		return
+	}
+
+	// Build list of incoming and outgoing PRs for this user
+	var incomingPRs []discord.PRSummary
+	var outgoingPRs []discord.PRSummary
+
+	for _, pr := range prs {
+		prInfo, ok := ParsePRURL(pr.URL)
+		if !ok {
+			continue
+		}
+
+		// Call Turn API to analyze this PR for this user
+		checkResp, err := c.turn.Check(ctx, pr.URL, githubUsername, pr.UpdatedAt)
+		if err != nil {
+			continue
+		}
+
+		// Determine PR state
+		prState := format.StateFromAnalysis(format.StateAnalysisParams{
+			Merged:             checkResp.PullRequest.Merged,
+			Closed:             checkResp.PullRequest.Closed,
+			Draft:              checkResp.PullRequest.Draft,
+			MergeConflict:      checkResp.Analysis.MergeConflict,
+			Approved:           checkResp.Analysis.Approved,
+			ChecksFailing:      checkResp.Analysis.Checks.Failing,
+			ChecksPending:      checkResp.Analysis.Checks.Pending,
+			ChecksWaiting:      checkResp.Analysis.Checks.Waiting,
+			UnresolvedComments: checkResp.Analysis.UnresolvedComments,
+			WorkflowState:      checkResp.Analysis.WorkflowState,
+		})
+
+		// Check if user has an action on this PR
+		action, hasAction := checkResp.Analysis.NextAction[githubUsername]
+		isAuthor := checkResp.PullRequest.Author == githubUsername
+
+		// Determine if PR is blocked (needs immediate attention)
+		isBlocked := prState == format.StateTestsBroken ||
+			prState == format.StateChanges ||
+			prState == format.StateConflict
+
+		summary := discord.PRSummary{
+			Repo:      prInfo.Repo,
+			Number:    prInfo.Number,
+			Title:     checkResp.PullRequest.Title,
+			Author:    checkResp.PullRequest.Author,
+			State:     string(prState),
+			URL:       pr.URL,
+			UpdatedAt: pr.UpdatedAt.Format(time.RFC3339),
+			IsBlocked: isBlocked,
+		}
+
+		if hasAction {
+			summary.Action = format.ActionLabel(action.Kind)
+		}
+
+		// Categorize as incoming or outgoing
+		if isAuthor {
+			outgoingPRs = append(outgoingPRs, summary)
+		} else if hasAction {
+			incomingPRs = append(incomingPRs, summary)
+		}
+	}
+
+	// Skip if no PRs for this user
+	if len(incomingPRs) == 0 && len(outgoingPRs) == 0 {
+		return
+	}
+
+	// TODO: Get user's timezone from Discord or config
+	// For now, default to UTC
+	timezone := "UTC"
+
+	// Build user blocking info
+	userInfo := dailyreport.UserBlockingInfo{
+		GitHubUsername: githubUsername,
+		DiscordUserID:  discordID,
+		GuildID:        guildID,
+		Timezone:       timezone,
+		IncomingPRs:    incomingPRs,
+		OutgoingPRs:    outgoingPRs,
+	}
+
+	// Check if report should be sent
+	if !sender.ShouldSendReport(ctx, userInfo) {
+		return
+	}
+
+	// Send the report
+	if err := sender.SendReport(ctx, userInfo); err != nil {
+		c.logger.Error("failed to send daily report",
+			"error", err,
+			"github_user", githubUsername,
+			"discord_id", discordID)
+	}
 }

@@ -150,3 +150,8 @@ func (c *OrgClient) InstallationToken(ctx context.Context) (string, error) {
 func (c *OrgClient) Org() string {
 	return c.org
 }
+
+// AppClient returns the underlying AppClient for creating searchers.
+func (m *Manager) AppClient() *AppClient {
+	return m.appClient
+}

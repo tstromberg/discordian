@@ -45,30 +45,88 @@ type FidoStore struct {
 	events   map[string]time.Time
 	eventsMu sync.RWMutex
 
+	// Reverse index: prURL -> userIDs who received DMs
+	// Populated when SaveDMInfo is called
+	dmUserIndex   map[string]map[string]bool
+	dmUserIndexMu sync.RWMutex
+
 	pendingMu sync.Mutex // Serializes pending DM operations
+}
+
+// FidoStoreOption configures a FidoStore.
+type FidoStoreOption func(*fidoStoreOptions)
+
+type fidoStoreOptions struct {
+	threadStore  fido.Store[string, ThreadInfo]
+	dmStore      fido.Store[string, DMInfo]
+	reportStore  fido.Store[string, DailyReportInfo]
+	pendingStore fido.Store[string, pendingDMQueue]
+}
+
+// WithThreadStore sets a custom store for thread data.
+func WithThreadStore(s fido.Store[string, ThreadInfo]) FidoStoreOption {
+	return func(o *fidoStoreOptions) { o.threadStore = s }
+}
+
+// WithDMStore sets a custom store for DM data.
+func WithDMStore(s fido.Store[string, DMInfo]) FidoStoreOption {
+	return func(o *fidoStoreOptions) { o.dmStore = s }
+}
+
+// WithReportStore sets a custom store for daily report data.
+func WithReportStore(s fido.Store[string, DailyReportInfo]) FidoStoreOption {
+	return func(o *fidoStoreOptions) { o.reportStore = s }
+}
+
+// WithPendingStore sets a custom store for pending DM data.
+func WithPendingStore(s fido.Store[string, pendingDMQueue]) FidoStoreOption {
+	return func(o *fidoStoreOptions) { o.pendingStore = s }
 }
 
 // NewFidoStore creates a new fido-backed store.
 // Uses CloudRun backend which auto-detects environment.
-func NewFidoStore(ctx context.Context) (*FidoStore, error) {
-	threadStore, err := cloudrun.New[string, ThreadInfo](ctx, "discordian-threads")
-	if err != nil {
-		return nil, fmt.Errorf("create thread store: %w", err)
+// Use WithThreadStore, WithDMStore, etc. to inject custom stores for testing.
+func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, error) {
+	var o fidoStoreOptions
+	for _, opt := range opts {
+		opt(&o)
 	}
 
-	dmStore, err := cloudrun.New[string, DMInfo](ctx, "discordian-dms")
-	if err != nil {
-		return nil, fmt.Errorf("create dm store: %w", err)
+	// Use provided stores or create cloudrun stores
+	threadStore := o.threadStore
+	if threadStore == nil {
+		var err error
+		threadStore, err = cloudrun.New[string, ThreadInfo](ctx, "discordian-threads")
+		if err != nil {
+			return nil, fmt.Errorf("create thread store: %w", err)
+		}
 	}
 
-	reportStore, err := cloudrun.New[string, DailyReportInfo](ctx, "discordian-reports")
-	if err != nil {
-		return nil, fmt.Errorf("create report store: %w", err)
+	dmStore := o.dmStore
+	if dmStore == nil {
+		var err error
+		dmStore, err = cloudrun.New[string, DMInfo](ctx, "discordian-dms")
+		if err != nil {
+			return nil, fmt.Errorf("create dm store: %w", err)
+		}
 	}
 
-	pendingStore, err := cloudrun.New[string, pendingDMQueue](ctx, "discordian-pending")
-	if err != nil {
-		return nil, fmt.Errorf("create pending store: %w", err)
+	reportStore := o.reportStore
+	if reportStore == nil {
+		var err error
+		reportStore, err = cloudrun.New[string, DailyReportInfo](ctx, "discordian-reports")
+		if err != nil {
+			return nil, fmt.Errorf("create report store: %w", err)
+		}
+	}
+
+	pendingStore := o.pendingStore
+	if pendingStore == nil {
+		var err error
+		pendingStore, err = cloudrun.New[string, pendingDMQueue](ctx, "discordian-pending")
+		if err != nil {
+			return nil, fmt.Errorf("create pending store: %w", err)
+		}
 	}
 
 	threads, err := fido.NewTiered(threadStore, fido.TTL(threadTTL))
@@ -91,13 +149,14 @@ func NewFidoStore(ctx context.Context) (*FidoStore, error) {
 		return nil, fmt.Errorf("create pending cache: %w", err)
 	}
 
-	slog.Info("initialized fido store with CloudRun backend")
+	slog.Info("initialized fido store")
 	return &FidoStore{
 		threads:      threads,
 		dmInfo:       dmInfo,
 		dailyReports: dailyReports,
 		pendingDMs:   pendingDMs,
 		events:       make(map[string]time.Time),
+		dmUserIndex:  make(map[string]map[string]bool),
 	}, nil
 }
 
@@ -133,7 +192,33 @@ func (s *FidoStore) DMInfo(ctx context.Context, userID, prURL string) (DMInfo, b
 // SaveDMInfo stores DM info for a user/PR.
 func (s *FidoStore) SaveDMInfo(ctx context.Context, userID, prURL string, info DMInfo) error {
 	key := fmt.Sprintf("%s:%s", userID, prURL)
+
+	// Update reverse index
+	s.dmUserIndexMu.Lock()
+	if s.dmUserIndex[prURL] == nil {
+		s.dmUserIndex[prURL] = make(map[string]bool)
+	}
+	s.dmUserIndex[prURL][userID] = true
+	s.dmUserIndexMu.Unlock()
+
 	return s.dmInfo.Set(ctx, key, info)
+}
+
+// ListDMUsers returns all user IDs who received DMs for a PR.
+func (s *FidoStore) ListDMUsers(_ context.Context, prURL string) []string {
+	s.dmUserIndexMu.RLock()
+	defer s.dmUserIndexMu.RUnlock()
+
+	users := s.dmUserIndex[prURL]
+	if users == nil {
+		return nil
+	}
+
+	result := make([]string, 0, len(users))
+	for userID := range users {
+		result = append(result, userID)
+	}
+	return result
 }
 
 // WasProcessed checks if an event was already processed.

@@ -6,6 +6,12 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
+)
+
+const (
+	// cacheTTL is how long cache entries are valid (same as slacker).
+	cacheTTL = 24 * time.Hour
 )
 
 // DiscordLookup defines the interface for Discord user lookup.
@@ -18,11 +24,17 @@ type ConfigLookup interface {
 	DiscordUserID(org, githubUsername string) string
 }
 
+// cacheEntry stores a cached mapping with timestamp.
+type cacheEntry struct {
+	discordID string
+	cachedAt  time.Time
+}
+
 // Mapper maps GitHub usernames to Discord user IDs.
 type Mapper struct {
 	configLookup  ConfigLookup
 	discordLookup DiscordLookup
-	cache         map[string]string
+	cache         map[string]cacheEntry
 	org           string
 	mu            sync.RWMutex
 }
@@ -33,7 +45,7 @@ func New(org string, configLookup ConfigLookup, discordLookup DiscordLookup) *Ma
 		org:           org,
 		configLookup:  configLookup,
 		discordLookup: discordLookup,
-		cache:         make(map[string]string),
+		cache:         make(map[string]cacheEntry),
 	}
 }
 
@@ -42,23 +54,47 @@ func New(org string, configLookup ConfigLookup, discordLookup DiscordLookup) *Ma
 // 1. YAML config mapping (explicit)
 // 2. Discord guild username match
 // 3. Empty string (fallback).
+// Results are cached for 24 hours.
 func (m *Mapper) DiscordID(ctx context.Context, githubUsername string) string {
-	// Check cache first
+	// Check cache first (with TTL)
 	m.mu.RLock()
-	if id, ok := m.cache[githubUsername]; ok {
-		m.mu.RUnlock()
-		return id
+	if entry, ok := m.cache[githubUsername]; ok {
+		if time.Since(entry.cachedAt) < cacheTTL {
+			m.mu.RUnlock()
+			return entry.discordID
+		}
+		// Entry expired, will re-lookup below
+		slog.Debug("cache entry expired, re-looking up",
+			"github", githubUsername)
 	}
 	m.mu.RUnlock()
 
 	// Tier 1: YAML config mapping
 	if m.configLookup != nil {
-		if id := m.configLookup.DiscordUserID(m.org, githubUsername); id != "" {
-			m.cacheResult(githubUsername, id)
-			slog.Debug("mapped user via config",
-				"github", githubUsername,
-				"discord_id", id)
-			return id
+		if configValue := m.configLookup.DiscordUserID(m.org, githubUsername); configValue != "" {
+			// Check if config value is a numeric ID or a Discord username
+			if isNumericID(configValue) {
+				// It's a numeric ID, use it directly
+				m.cacheResult(githubUsername, configValue)
+				slog.Debug("mapped user via config (numeric ID)",
+					"github", githubUsername,
+					"discord_id", configValue)
+				return configValue
+			}
+			// It's a Discord username, resolve it to numeric ID
+			if m.discordLookup != nil {
+				if id := m.discordLookup.LookupUserByUsername(ctx, configValue); id != "" {
+					m.cacheResult(githubUsername, id)
+					slog.Debug("mapped user via config (username resolved)",
+						"github", githubUsername,
+						"discord_username", configValue,
+						"discord_id", id)
+					return id
+				}
+				slog.Warn("config specified Discord username not found in guild",
+					"github", githubUsername,
+					"discord_username", configValue)
+			}
 		}
 	}
 
@@ -91,12 +127,29 @@ func (m *Mapper) Mention(ctx context.Context, githubUsername string) string {
 func (m *Mapper) cacheResult(githubUsername, discordID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.cache[githubUsername] = discordID
+	m.cache[githubUsername] = cacheEntry{
+		discordID: discordID,
+		cachedAt:  time.Now(),
+	}
+}
+
+// isNumericID returns true if the string looks like a Discord numeric ID.
+// Discord IDs are 17-19 digit snowflakes.
+func isNumericID(s string) bool {
+	if len(s) < 17 || len(s) > 20 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ClearCache clears the user mapping cache.
 func (m *Mapper) ClearCache() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.cache = make(map[string]string)
+	m.cache = make(map[string]cacheEntry)
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -342,20 +343,27 @@ func isAuthError(err error) bool {
 	return errors.As(err, &ae)
 }
 
+// PRURLInfo contains parsed PR URL components.
+type PRURLInfo struct {
+	Owner  string
+	Repo   string
+	Number int
+}
+
 // ParsePRURL extracts owner, repo, and number from a GitHub PR URL.
-func ParsePRURL(url string) (owner, repo string, number int, ok bool) {
+func ParsePRURL(url string) (PRURLInfo, bool) {
 	// https://github.com/owner/repo/pull/123
 	parts := strings.Split(url, "/")
 	if len(parts) < 7 || parts[2] != "github.com" || parts[5] != "pull" {
-		return "", "", 0, false
+		return PRURLInfo{}, false
 	}
 
 	var n int
 	if _, err := fmt.Sscanf(parts[6], "%d", &n); err != nil {
-		return "", "", 0, false
+		return PRURLInfo{}, false
 	}
 
-	return parts[3], parts[4], n, true
+	return PRURLInfo{Owner: parts[3], Repo: parts[4], Number: n}, true
 }
 
 // FormatPRURL creates a GitHub PR URL from components.
@@ -392,6 +400,12 @@ func (c *TurnHTTPClient) Check(ctx context.Context, prURL, username string, upda
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
+	start := time.Now()
+	slog.Debug("calling Turn API",
+		"url", prURL,
+		"username", username,
+		"updated_at", updatedAt.Format(time.RFC3339))
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/validate", strings.NewReader(string(body)))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -401,19 +415,43 @@ func (c *TurnHTTPClient) Check(ctx context.Context, prURL, username string, upda
 	req.Header.Set("Authorization", "Bearer "+c.token)
 
 	resp, err := c.client.Do(req)
+	duration := time.Since(start)
 	if err != nil {
+		slog.Error("Turn API request failed",
+			"url", prURL,
+			"error", err,
+			"duration_ms", duration.Milliseconds())
 		return nil, fmt.Errorf("do request: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // response body must be closed
 
 	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body) //nolint:errcheck // best effort to log response body
+		slog.Error("Turn API returned error",
+			"url", prURL,
+			"status", resp.StatusCode,
+			"body", string(respBody),
+			"duration_ms", duration.Milliseconds())
 		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
 	var result CheckResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		slog.Error("Turn API response decode failed",
+			"url", prURL,
+			"error", err,
+			"duration_ms", duration.Milliseconds())
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
+
+	slog.Debug("Turn API response received",
+		"url", prURL,
+		"workflow_state", result.Analysis.WorkflowState,
+		"ready_to_merge", result.Analysis.ReadyToMerge,
+		"checks_failing", result.Analysis.Checks.Failing,
+		"next_action_count", len(result.Analysis.NextAction),
+		"next_action", result.Analysis.NextAction,
+		"duration_ms", duration.Milliseconds())
 
 	return &result, nil
 }

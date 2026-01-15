@@ -12,6 +12,7 @@ import (
 type MemoryStore struct {
 	threads      map[string]ThreadInfo
 	dmInfo       map[string]DMInfo
+	dmUserIndex  map[string]map[string]bool // prURL -> userIDs who received DMs
 	processed    map[string]time.Time
 	pendingDMs   map[string]*PendingDM
 	dailyReports map[string]DailyReportInfo
@@ -26,6 +27,7 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		threads:      make(map[string]ThreadInfo),
 		dmInfo:       make(map[string]DMInfo),
+		dmUserIndex:  make(map[string]map[string]bool),
 		processed:    make(map[string]time.Time),
 		pendingDMs:   make(map[string]*PendingDM),
 		dailyReports: make(map[string]DailyReportInfo),
@@ -80,11 +82,17 @@ func (s *MemoryStore) DMInfo(ctx context.Context, userID, prURL string) (DMInfo,
 }
 
 // SaveDMInfo saves DM info.
-func (s *MemoryStore) SaveDMInfo(ctx context.Context, userID, prURL string, info DMInfo) error {
+func (s *MemoryStore) SaveDMInfo(_ context.Context, userID, prURL string, info DMInfo) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.dmInfo[dmKey(userID, prURL)] = info
+
+	// Update reverse index
+	if s.dmUserIndex[prURL] == nil {
+		s.dmUserIndex[prURL] = make(map[string]bool)
+	}
+	s.dmUserIndex[prURL][userID] = true
 
 	slog.Debug("saved DM info",
 		"user_id", userID,
@@ -92,6 +100,23 @@ func (s *MemoryStore) SaveDMInfo(ctx context.Context, userID, prURL string, info
 		"channel_id", info.ChannelID)
 
 	return nil
+}
+
+// ListDMUsers returns all user IDs who received DMs for a PR.
+func (s *MemoryStore) ListDMUsers(_ context.Context, prURL string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	users := s.dmUserIndex[prURL]
+	if users == nil {
+		return nil
+	}
+
+	result := make([]string, 0, len(users))
+	for userID := range users {
+		result = append(result, userID)
+	}
+	return result
 }
 
 // WasProcessed checks if an event was already processed.
@@ -226,10 +251,23 @@ func (*MemoryStore) Close() error {
 	return nil
 }
 
+// StoreStats contains store statistics.
+type StoreStats struct {
+	Threads int
+	DMs     int
+	Events  int
+	Pending int
+}
+
 // Stats returns current store statistics.
-func (s *MemoryStore) Stats() (threads, dms, events, pending int) {
+func (s *MemoryStore) Stats() StoreStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return len(s.threads), len(s.dmInfo), len(s.processed), len(s.pendingDMs)
+	return StoreStats{
+		Threads: len(s.threads),
+		DMs:     len(s.dmInfo),
+		Events:  len(s.processed),
+		Pending: len(s.pendingDMs),
+	}
 }

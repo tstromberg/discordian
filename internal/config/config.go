@@ -219,6 +219,11 @@ func (*Manager) fetchConfig(ctx context.Context, client *github.Client, org stri
 	var content *github.RepositoryContent
 	var err error
 
+	slog.Debug("fetching discord.yaml config from GitHub",
+		"org", org,
+		"repo", ".codeGROOVE",
+		"file", "discord.yaml")
+
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
 		content, _, _, err = client.Repositories.GetContents(ctx, org, ".codeGROOVE", "discord.yaml", nil)
 		if err == nil {
@@ -227,8 +232,16 @@ func (*Manager) fetchConfig(ctx context.Context, client *github.Client, org stri
 
 		var ghErr *github.ErrorResponse
 		if errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusNotFound {
+			slog.Debug("config file not found in GitHub repo",
+				"org", org)
 			return nil, errors.New("config not found")
 		}
+
+		slog.Warn("GitHub API call failed, retrying",
+			"org", org,
+			"attempt", attempt,
+			"max_attempts", maxRetryAttempts,
+			"error", err)
 
 		if attempt < maxRetryAttempts {
 			delay := retryDelay * time.Duration(1<<(attempt-1))

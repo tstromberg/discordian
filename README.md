@@ -25,6 +25,13 @@ The Discord integration for [reviewGOOSE](https://codegroove.dev/reviewgoose/) �
 
 [Add reviewGOOSE to Discord](https://discord.com/oauth2/authorize?client_id=1461368540190871831&permissions=2147485696&scope=bot%20applications.commands)
 
+**Channel Access:**
+- Public channels: Bot automatically has access after installation
+- Private channels: Manually add the bot via channel settings:
+  1. Right-click channel → Edit Channel → Permissions
+  2. Click "+" → Select reviewGOOSE bot
+  3. Enable "View Channel" permission
+
 ### 2. Install the GitHub App
 
 Install the [reviewGOOSE GitHub App](https://github.com/apps/reviewgoose) on your organization.
@@ -139,7 +146,8 @@ Add explicit mappings for users whose Discord and GitHub usernames differ.
 
 **Messages not appearing in channels**
 - Check channel name matches repo name or is configured in yaml
-- Verify bot has "Send Messages" permission
+- For private channels: verify bot has been added to the channel (Edit Channel → Permissions → Add bot → Enable "View Channel")
+- Verify bot has "Send Messages" permission in channel settings
 - For forum channels: verify bot has "Create Public Threads" permission
 
 **DMs not working**

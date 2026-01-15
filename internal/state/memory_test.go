@@ -159,18 +159,18 @@ func TestMemoryStore(t *testing.T) {
 	})
 
 	t.Run("stats", func(t *testing.T) {
-		threads, dms, events, pending := store.Stats()
-		if threads < 1 {
-			t.Errorf("Stats() threads = %d, want >= 1", threads)
+		stats := store.Stats()
+		if stats.Threads < 1 {
+			t.Errorf("Stats() threads = %d, want >= 1", stats.Threads)
 		}
-		if dms < 1 {
-			t.Errorf("Stats() dms = %d, want >= 1", dms)
+		if stats.DMs < 1 {
+			t.Errorf("Stats() dms = %d, want >= 1", stats.DMs)
 		}
-		if events < 1 {
-			t.Errorf("Stats() events = %d, want >= 1", events)
+		if stats.Events < 1 {
+			t.Errorf("Stats() events = %d, want >= 1", stats.Events)
 		}
 		// pending could be 0 or 1 depending on previous test
-		_ = pending
+		_ = stats.Pending
 	})
 }
 
@@ -264,5 +264,63 @@ func TestMemoryStore_WasProcessed_Expired(t *testing.T) {
 	// Should return false since event expired
 	if store.WasProcessed(ctx, "expiring-event") {
 		t.Error("WasProcessed() should return false for expired event")
+	}
+}
+
+func TestMemoryStore_DailyReportInfo(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	defer store.Close() //nolint:errcheck // test cleanup
+
+	userID := "user123"
+
+	// Initially no report info
+	_, ok := store.DailyReportInfo(ctx, userID)
+	if ok {
+		t.Error("DailyReportInfo() found non-existent info")
+	}
+
+	// Save report info
+	info := DailyReportInfo{
+		LastSentAt: time.Now(),
+		GuildID:    "guild123",
+	}
+	if err := store.SaveDailyReportInfo(ctx, userID, info); err != nil {
+		t.Fatalf("SaveDailyReportInfo() error = %v", err)
+	}
+
+	// Retrieve report info
+	got, ok := store.DailyReportInfo(ctx, userID)
+	if !ok {
+		t.Fatal("DailyReportInfo() did not find saved info")
+	}
+	if got.GuildID != info.GuildID {
+		t.Errorf("DailyReportInfo().GuildID = %q, want %q", got.GuildID, info.GuildID)
+	}
+	if got.LastSentAt.IsZero() {
+		t.Error("DailyReportInfo().LastSentAt should not be zero")
+	}
+
+	// Different user returns nothing
+	_, ok = store.DailyReportInfo(ctx, "other-user")
+	if ok {
+		t.Error("DailyReportInfo() should not find info for different user")
+	}
+
+	// Update existing
+	newInfo := DailyReportInfo{
+		LastSentAt: time.Now().Add(time.Hour),
+		GuildID:    "guild456",
+	}
+	if err := store.SaveDailyReportInfo(ctx, userID, newInfo); err != nil {
+		t.Fatalf("SaveDailyReportInfo() update error = %v", err)
+	}
+
+	got, ok = store.DailyReportInfo(ctx, userID)
+	if !ok {
+		t.Fatal("DailyReportInfo() did not find updated info")
+	}
+	if got.GuildID != newInfo.GuildID {
+		t.Errorf("Updated DailyReportInfo().GuildID = %q, want %q", got.GuildID, newInfo.GuildID)
 	}
 }

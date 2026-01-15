@@ -48,6 +48,10 @@ func (m *mockStore) SaveDMInfo(_ context.Context, userID, prURL string, info sta
 	return nil
 }
 
+func (m *mockStore) ListDMUsers(_ context.Context, _ string) []string {
+	return nil
+}
+
 func (m *mockStore) WasProcessed(_ context.Context, _ string) bool {
 	return false
 }

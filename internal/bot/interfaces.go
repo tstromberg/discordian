@@ -33,6 +33,12 @@ type DiscordClient interface {
 
 	// Guild info
 	GuildID() string
+
+	// Search operations (for cross-instance race prevention)
+	FindForumThread(ctx context.Context, forumID, prURL string) (threadID, messageID string, found bool)
+	FindChannelMessage(ctx context.Context, channelID, prURL string) (messageID string, found bool)
+	FindDMForPR(ctx context.Context, userID, prURL string) (channelID, messageID string, found bool)
+	GetMessageContent(ctx context.Context, channelID, messageID string) (string, error)
 }
 
 // ConfigManager defines configuration operations.
@@ -54,11 +60,14 @@ type StateStore interface {
 	SaveThread(ctx context.Context, owner, repo string, number int, channelID string, info state.ThreadInfo) error
 	DMInfo(ctx context.Context, userID, prURL string) (state.DMInfo, bool)
 	SaveDMInfo(ctx context.Context, userID, prURL string, info state.DMInfo) error
+	ListDMUsers(ctx context.Context, prURL string) []string // Returns all user IDs who received DMs for this PR
 	WasProcessed(ctx context.Context, eventKey string) bool
 	MarkProcessed(ctx context.Context, eventKey string, ttl time.Duration) error
 	QueuePendingDM(ctx context.Context, dm *state.PendingDM) error
 	PendingDMs(ctx context.Context, before time.Time) ([]*state.PendingDM, error)
 	RemovePendingDM(ctx context.Context, id string) error
+	DailyReportInfo(ctx context.Context, userID string) (state.DailyReportInfo, bool)
+	SaveDailyReportInfo(ctx context.Context, userID string, info state.DailyReportInfo) error
 	Cleanup(ctx context.Context) error
 }
 
@@ -86,20 +95,21 @@ type PRInfo struct {
 
 // Analysis contains the PR analysis result.
 type Analysis struct {
-	Tags          []string          `json:"tags"`
-	NextAction    map[string]Action `json:"next_action"`
-	Checks        Checks            `json:"checks"`
-	WorkflowState string            `json:"workflow_state"`
-	Size          string            `json:"size"`
-	ReadyToMerge  bool              `json:"ready_to_merge"`
-	Approved      bool              `json:"approved"`
-	MergeConflict bool              `json:"merge_conflict"`
+	Tags               []string          `json:"tags"`
+	NextAction         map[string]Action `json:"next_action"`
+	Checks             Checks            `json:"checks"`
+	WorkflowState      string            `json:"workflow_state"`
+	Size               string            `json:"size"`
+	UnresolvedComments int               `json:"unresolved_comments"`
+	ReadyToMerge       bool              `json:"ready_to_merge"`
+	Approved           bool              `json:"approved"`
+	MergeConflict      bool              `json:"merge_conflict"`
 }
 
 // Action represents what a user needs to do.
 type Action struct {
-	Action  string `json:"action"`
-	Message string `json:"message"`
+	Kind   string `json:"kind"`
+	Reason string `json:"reason"`
 }
 
 // Checks contains CI check status.
@@ -107,6 +117,7 @@ type Checks struct {
 	Pending int `json:"pending"`
 	Passing int `json:"passing"`
 	Failing int `json:"failing"`
+	Waiting int `json:"waiting"`
 }
 
 // SprinklerEvent represents an event from the sprinkler WebSocket.
@@ -130,4 +141,21 @@ type NotificationTracker interface {
 	MarkTaggedInChannel(prURL, userID string)
 	LastDMTime(userID, prURL string) time.Time
 	MarkDMSent(userID, prURL string)
+}
+
+// PRSearcher queries GitHub for PRs.
+type PRSearcher interface {
+	// ListOpenPRs returns open PRs for an org updated within the given hours.
+	ListOpenPRs(ctx context.Context, org string, updatedWithinHours int) ([]PRSearchResult, error)
+	// ListClosedPRs returns recently closed/merged PRs for catching terminal states.
+	ListClosedPRs(ctx context.Context, org string, closedWithinHours int) ([]PRSearchResult, error)
+}
+
+// PRSearchResult contains basic PR info for polling.
+type PRSearchResult struct {
+	UpdatedAt time.Time
+	URL       string
+	Owner     string
+	Repo      string
+	Number    int
 }

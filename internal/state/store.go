@@ -23,6 +23,7 @@ type DMInfo struct {
 	ChannelID   string    `json:"channel_id"`
 	MessageID   string    `json:"message_id"`
 	MessageText string    `json:"message_text"`
+	LastState   string    `json:"last_state"` // PR state when DM was sent/updated
 }
 
 // PendingDM represents a scheduled DM notification.
@@ -52,6 +53,7 @@ type Store interface {
 	// DM tracking
 	DMInfo(ctx context.Context, userID, prURL string) (DMInfo, bool)
 	SaveDMInfo(ctx context.Context, userID, prURL string, info DMInfo) error
+	ListDMUsers(ctx context.Context, prURL string) []string // Returns all user IDs who received DMs for this PR
 
 	// Event deduplication
 	WasProcessed(ctx context.Context, eventKey string) bool

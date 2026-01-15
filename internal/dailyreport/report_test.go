@@ -272,6 +272,29 @@ func TestRandomGreeting(t *testing.T) {
 	}
 }
 
+func TestSender_SendReport_DMError(t *testing.T) {
+	store := newMockStateStore()
+	sender := NewSender(store, nil)
+	dmSender := newMockDMSender()
+	dmSender.sendErr = context.DeadlineExceeded // Simulate an error
+	sender.RegisterGuild("guild1", dmSender)
+
+	userInfo := UserBlockingInfo{
+		DiscordUserID:  "user123",
+		GitHubUsername: "ghuser",
+		GuildID:        "guild1",
+		IncomingPRs:    []discord.PRSummary{{Repo: "test", Number: 1}},
+	}
+
+	err := sender.SendReport(context.Background(), userInfo)
+	if err == nil {
+		t.Error("SendReport() should return error when SendDM fails")
+	}
+	if !strings.Contains(err.Error(), "failed to send DM") {
+		t.Errorf("error should mention 'failed to send DM', got: %v", err)
+	}
+}
+
 func TestNewSender(t *testing.T) {
 	store := newMockStateStore()
 

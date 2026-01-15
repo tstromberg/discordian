@@ -17,6 +17,8 @@ github.com/codeGROOVE-dev/fido/pkg/store/datastore v1.10.0 h1:vCsLeESGQvW7F8pJJi
 github.com/codeGROOVE-dev/fido/pkg/store/datastore v1.10.0/go.mod h1:LtpO9TUi92D7uLBXJu+kLWVpRmEtVRAWVB2EdzNU0JQ=
 github.com/codeGROOVE-dev/fido/pkg/store/localfs v1.10.0 h1:oaPwuHHBuzhsWnPm7UCxgwjz7+jG3O0JenSSgPSwqv8=
 github.com/codeGROOVE-dev/fido/pkg/store/localfs v1.10.0/go.mod h1:zUGzODSWykosAod0IHycxdxUOMcd2eVqd6eUdOsU73E=
+github.com/codeGROOVE-dev/fido/pkg/store/null v1.10.0 h1:3F6absPj3zUaPsK7ohTTlwOXZ2XAr+/TudIPCYPamsw=
+github.com/codeGROOVE-dev/fido/pkg/store/null v1.10.0/go.mod h1:mvPXZ0lHnaQuxkSozpmWf2ZKL5bzKe/IIGFLlcQH/F4=
 github.com/codeGROOVE-dev/gsm v0.0.0-20251019065141-833fe2363d22 h1:gtN3rOc6YspO646BkcOxBhPjEqKUz+jl175jIqglfDg=
 github.com/codeGROOVE-dev/gsm v0.0.0-20251019065141-833fe2363d22/go.mod h1:KV+w19ubP32PxZPE1hOtlCpTaNpF0Bpb32w5djO8UTg=
 github.com/golang-jwt/jwt/v5 v5.3.0 h1:pv4AsKCKKZuqlgs5sUmn4x8UlGa0kEVt/puTpKx9vvo=

@@ -1,8 +1,15 @@
 package config
 
 import (
+	"context"
+	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/go-github/v50/github"
 )
 
 func TestManager_ChannelsForRepo(t *testing.T) {
@@ -379,5 +386,240 @@ func TestManager_ReminderDMDelay_GlobalZero(t *testing.T) {
 	got := m.ReminderDMDelay("testorg", "some-channel")
 	if got != 65 {
 		t.Errorf("ReminderDMDelay() = %d, want default 65 when global is 0", got)
+	}
+}
+
+func TestManager_LoadConfig_Cached(t *testing.T) {
+	m := New()
+
+	// Pre-populate the cache
+	cfg := &DiscordConfig{
+		Global: GlobalConfig{GuildID: "cached-guild"},
+	}
+	m.cache.set("testorg", cfg)
+
+	// LoadConfig should use cached value
+	err := m.LoadConfig(t.Context(), "testorg")
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+
+	// Verify config was loaded from cache
+	got, exists := m.Config("testorg")
+	if !exists {
+		t.Error("Config should exist after LoadConfig")
+	}
+	if got.Global.GuildID != "cached-guild" {
+		t.Errorf("Config().Global.GuildID = %q, want %q", got.Global.GuildID, "cached-guild")
+	}
+}
+
+func TestManager_LoadConfig_NoClient(t *testing.T) {
+	m := New()
+
+	// No client set for org
+	err := m.LoadConfig(t.Context(), "testorg")
+	if err == nil {
+		t.Error("LoadConfig() should error when no client")
+	}
+	if !strings.Contains(err.Error(), "github client not initialized") {
+		t.Errorf("LoadConfig() error = %v, want 'github client not initialized'", err)
+	}
+}
+
+func TestManager_LoadConfig_WrongClientType(t *testing.T) {
+	m := New()
+
+	// Set wrong type of client
+	m.SetGitHubClient("testorg", "not-a-github-client")
+
+	err := m.LoadConfig(t.Context(), "testorg")
+	if err == nil {
+		t.Error("LoadConfig() should error with wrong client type")
+	}
+	if !strings.Contains(err.Error(), "invalid github client type") {
+		t.Errorf("LoadConfig() error = %v, want 'invalid github client type'", err)
+	}
+}
+
+func TestManager_ReloadConfig_InvalidatesCache(t *testing.T) {
+	m := New()
+
+	// Pre-populate the cache
+	cfg := &DiscordConfig{
+		Global: GlobalConfig{GuildID: "cached-guild"},
+	}
+	m.cache.set("testorg", cfg)
+
+	// Verify cache hit
+	_, found := m.cache.get("testorg")
+	if !found {
+		t.Fatal("Cache should have entry before reload")
+	}
+
+	// ReloadConfig should fail (no client) but cache should be invalidated
+	_ = m.ReloadConfig(t.Context(), "testorg")
+
+	// Cache should be invalidated
+	_, found = m.cache.get("testorg")
+	if found {
+		t.Error("Cache should be invalidated after ReloadConfig")
+	}
+}
+
+// newTestGitHubClient creates a GitHub client pointing to a test server.
+func newTestGitHubClient(t *testing.T, serverURL string) *github.Client {
+	t.Helper()
+	client := github.NewClient(nil)
+	baseURL, err := client.BaseURL.Parse(serverURL + "/")
+	if err != nil {
+		t.Fatalf("Failed to parse server URL: %v", err)
+	}
+	client.BaseURL = baseURL
+	return client
+}
+
+func TestManager_LoadConfig_WithGitHubMock(t *testing.T) {
+	// YAML config content
+	yamlContent := `
+global:
+  guild_id: "123456789"
+  reminder_dm_delay: 30
+channels:
+  backend:
+    repos: ["api"]
+    type: text
+users:
+  alice: "111111111"
+`
+
+	// Create mock GitHub API server
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Mock the GetContents endpoint
+	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, r *http.Request) {
+		encoded := base64.StdEncoding.EncodeToString([]byte(yamlContent))
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"type": "file",
+			"encoding": "base64",
+			"content": "` + encoded + `"
+		}`))
+	})
+
+	client := newTestGitHubClient(t, server.URL)
+	m := New()
+	m.SetGitHubClient("testorg", client)
+
+	// Load config
+	err := m.LoadConfig(context.Background(), "testorg")
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+
+	// Verify config was loaded
+	cfg, exists := m.Config("testorg")
+	if !exists {
+		t.Fatal("Config should exist after LoadConfig")
+	}
+	if cfg.Global.GuildID != "123456789" {
+		t.Errorf("GuildID = %q, want %q", cfg.Global.GuildID, "123456789")
+	}
+	if cfg.Global.ReminderDMDelay != 30 {
+		t.Errorf("ReminderDMDelay = %d, want 30", cfg.Global.ReminderDMDelay)
+	}
+	if cfg.Users["alice"] != "111111111" {
+		t.Errorf("Users[alice] = %q, want %q", cfg.Users["alice"], "111111111")
+	}
+}
+
+func TestManager_LoadConfig_NotFound(t *testing.T) {
+	// Create mock GitHub API server that returns 404
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"message": "Not Found"}`))
+	})
+
+	client := newTestGitHubClient(t, server.URL)
+	m := New()
+	m.SetGitHubClient("testorg", client)
+
+	// Load config - should succeed with default config
+	err := m.LoadConfig(context.Background(), "testorg")
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+
+	// Should have default config
+	cfg, exists := m.Config("testorg")
+	if !exists {
+		t.Fatal("Config should exist after LoadConfig (with defaults)")
+	}
+	if cfg.Global.ReminderDMDelay != 65 {
+		t.Errorf("Default ReminderDMDelay = %d, want 65", cfg.Global.ReminderDMDelay)
+	}
+}
+
+func TestManager_LoadConfig_InvalidYAML(t *testing.T) {
+	// Create mock GitHub API server that returns invalid YAML
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, r *http.Request) {
+		encoded := base64.StdEncoding.EncodeToString([]byte("invalid: yaml: content: ["))
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"type": "file",
+			"encoding": "base64",
+			"content": "` + encoded + `"
+		}`))
+	})
+
+	client := newTestGitHubClient(t, server.URL)
+	m := New()
+	m.SetGitHubClient("testorg", client)
+
+	// Load config - should succeed with default config (invalid YAML falls back)
+	err := m.LoadConfig(context.Background(), "testorg")
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+
+	// Should have default config
+	cfg, exists := m.Config("testorg")
+	if !exists {
+		t.Fatal("Config should exist after LoadConfig (with defaults)")
+	}
+	if cfg.Global.ReminderDMDelay != 65 {
+		t.Errorf("Default ReminderDMDelay = %d, want 65", cfg.Global.ReminderDMDelay)
+	}
+}
+
+func TestManager_fetchConfig_EmptyContent(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Return file with no content
+		w.Write([]byte(`{
+			"type": "file",
+			"encoding": "base64"
+		}`))
+	})
+
+	client := newTestGitHubClient(t, server.URL)
+	m := New()
+	_, err := m.fetchConfig(context.Background(), client, "testorg")
+	if err == nil {
+		t.Error("fetchConfig() should error on empty content")
 	}
 }

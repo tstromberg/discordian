@@ -3,6 +3,7 @@ package usermapping
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 type mockConfigLookup struct {
@@ -216,5 +217,136 @@ func TestMapper_NilLookups(t *testing.T) {
 	mention := mapper.Mention(ctx, "anyone")
 	if mention != "anyone" {
 		t.Errorf("Mention with nil lookups = %q, want plain username", mention)
+	}
+}
+
+func TestMapper_DiscordID_CacheTTL(t *testing.T) {
+	ctx := context.Background()
+
+	discordLookup := &mockDiscordLookup{
+		users: map[string]string{
+			"bob": "222222222222222222",
+		},
+	}
+
+	mapper := New("testorg", nil, discordLookup)
+
+	// First call - populates cache
+	id1 := mapper.DiscordID(ctx, "bob")
+	if id1 != "222222222222222222" {
+		t.Errorf("First DiscordID(bob) = %q, want 222222222222222222", id1)
+	}
+
+	// Manually expire the cache entry by setting cachedAt to past TTL
+	mapper.mu.Lock()
+	if entry, ok := mapper.cache["bob"]; ok {
+		entry.cachedAt = time.Now().Add(-25 * time.Hour) // Older than 24h TTL
+		mapper.cache["bob"] = entry
+	}
+	mapper.mu.Unlock()
+
+	// Change underlying data
+	discordLookup.users["bob"] = "999999999999999999"
+
+	// After TTL expiry, should get fresh value
+	id2 := mapper.DiscordID(ctx, "bob")
+	if id2 != "999999999999999999" {
+		t.Errorf("After TTL expiry, DiscordID(bob) = %q, want fresh 999999999999999999", id2)
+	}
+}
+
+func TestMapper_ConfigUsernameResolution(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name           string
+		configValue    string
+		discordUsers   map[string]string
+		githubUsername string
+		wantID         string
+		description    string
+	}{
+		{
+			name:           "config with numeric ID uses it directly",
+			configValue:    "111111111111111111",
+			discordUsers:   map[string]string{},
+			githubUsername: "alice",
+			wantID:         "111111111111111111",
+			description:    "Numeric ID in config should be used without Discord lookup",
+		},
+		{
+			name:        "config with Discord username resolves it",
+			configValue: "alice_discord",
+			discordUsers: map[string]string{
+				"alice_discord": "222222222222222222",
+			},
+			githubUsername: "alice",
+			wantID:         "222222222222222222",
+			description:    "Discord username in config should be resolved to numeric ID",
+		},
+		{
+			name:           "config with Discord username not found falls back",
+			configValue:    "nonexistent",
+			discordUsers:   map[string]string{},
+			githubUsername: "alice",
+			wantID:         "",
+			description:    "Discord username not found should fall back (no ID)",
+		},
+		{
+			name:        "config maps GitHub user to different Discord username",
+			configValue: "bob_discord",
+			discordUsers: map[string]string{
+				"bob_discord": "333333333333333333",
+			},
+			githubUsername: "bob_github",
+			wantID:         "333333333333333333",
+			description:    "GitHub username mapped to different Discord username",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configLookup := &mockConfigLookup{
+				users: map[string]string{
+					tt.githubUsername: tt.configValue,
+				},
+			}
+
+			discordLookup := &mockDiscordLookup{
+				users: tt.discordUsers,
+			}
+
+			mapper := New("testorg", configLookup, discordLookup)
+
+			got := mapper.DiscordID(ctx, tt.githubUsername)
+			if got != tt.wantID {
+				t.Errorf("%s: DiscordID(%q) = %q, want %q",
+					tt.description, tt.githubUsername, got, tt.wantID)
+			}
+		})
+	}
+}
+
+func TestMapper_ConfigUsernameResolution_Mention(t *testing.T) {
+	ctx := context.Background()
+
+	configLookup := &mockConfigLookup{
+		users: map[string]string{
+			"alice": "alice_discord", // Discord username (not numeric ID)
+		},
+	}
+
+	discordLookup := &mockDiscordLookup{
+		users: map[string]string{
+			"alice_discord": "111111111111111111",
+		},
+	}
+
+	mapper := New("testorg", configLookup, discordLookup)
+
+	got := mapper.Mention(ctx, "alice")
+	want := "<@111111111111111111>"
+	if got != want {
+		t.Errorf("Mention with username in config = %q, want %q", got, want)
 	}
 }

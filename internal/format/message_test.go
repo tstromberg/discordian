@@ -10,9 +10,11 @@ func TestStateEmoji(t *testing.T) {
 		state PRState
 		want  string
 	}{
+		{StateNewlyPublished, EmojiNewlyPublished},
 		{StateDraft, EmojiDraft},
 		{StateTestsRunning, EmojiTestsRunning},
 		{StateTestsBroken, EmojiTestsBroken},
+		{StateAwaitingAssign, EmojiAwaitingAssign},
 		{StateNeedsReview, EmojiNeedsReview},
 		{StateChanges, EmojiChanges},
 		{StateApproved, EmojiApproved},
@@ -28,6 +30,36 @@ func TestStateEmoji(t *testing.T) {
 			got := StateEmoji(tt.state)
 			if got != tt.want {
 				t.Errorf("StateEmoji(%q) = %q, want %q", tt.state, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStateText(t *testing.T) {
+	tests := []struct {
+		state PRState
+		want  string
+	}{
+		{StateTestsRunning, "tests pending"},
+		{StateTestsBroken, "tests failing"},
+		{StateNeedsReview, "needs review"},
+		{StateAwaitingAssign, "awaiting assignment"},
+		{StateChanges, "changes requested"},
+		{StateConflict, "merge conflict"},
+		// States without text labels
+		{StateNewlyPublished, ""},
+		{StateDraft, ""},
+		{StateApproved, ""},
+		{StateMerged, ""},
+		{StateClosed, ""},
+		{StateUnknown, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.state), func(t *testing.T) {
+			got := StateText(tt.state)
+			if got != tt.want {
+				t.Errorf("StateText(%q) = %q, want %q", tt.state, got, tt.want)
 			}
 		})
 	}
@@ -53,8 +85,64 @@ func TestChannelMessage(t *testing.T) {
 			want: []string{
 				EmojiNeedsReview,
 				"[repo#123]",
-				"Fix the bug",
-				"alice",
+				" · Fix the bug",  // Dot delimiter before title
+				" · alice",        // Dot delimiter before author
+				" • needs review", // State text with bullet delimiter
+			},
+		},
+		{
+			name: "tests pending state",
+			params: ChannelMessageParams{
+				Owner:  "org",
+				Repo:   "turnserver",
+				Number: 18,
+				Title:  "Add GitLab/GitTea support",
+				Author: "tstromberg",
+				State:  StateTestsRunning,
+				PRURL:  "https://github.com/org/turnserver/pull/18",
+			},
+			want: []string{
+				EmojiTestsRunning,
+				"[turnserver#18]",
+				" · Add GitLab/GitTea support", // Dot delimiter before title
+				" · tstromberg",                // Dot delimiter before author
+				" • tests pending",             // State text
+			},
+		},
+		{
+			name: "tests failing state",
+			params: ChannelMessageParams{
+				Owner:  "org",
+				Repo:   "repo",
+				Number: 99,
+				Title:  "Breaking change",
+				Author: "bob",
+				State:  StateTestsBroken,
+				PRURL:  "https://github.com/org/repo/pull/99",
+			},
+			want: []string{
+				EmojiTestsBroken,
+				" · Breaking change",
+				" · bob",
+				" • tests failing",
+			},
+		},
+		{
+			name: "merge conflict state",
+			params: ChannelMessageParams{
+				Owner:  "org",
+				Repo:   "repo",
+				Number: 50,
+				Title:  "Outdated branch",
+				Author: "charlie",
+				State:  StateConflict,
+				PRURL:  "https://github.com/org/repo/pull/50",
+			},
+			want: []string{
+				EmojiConflict,
+				" · Outdated branch",
+				" · charlie",
+				" • merge conflict",
 			},
 		},
 		{
@@ -73,12 +161,31 @@ func TestChannelMessage(t *testing.T) {
 			},
 			want: []string{
 				EmojiChanges,
-				"<@123>",
-				"needs to review",
+				" · New feature",
+				" · bob",
+				" • changes requested",            // State text
+				" • **needs to review** → <@123>", // Action users after state text
 			},
 		},
 		{
-			name: "multiple action users",
+			name: "state without text label (approved)",
+			params: ChannelMessageParams{
+				Owner:  "org",
+				Repo:   "repo",
+				Number: 10,
+				Title:  "Ready to merge",
+				Author: "dave",
+				State:  StateApproved,
+				PRURL:  "https://github.com/org/repo/pull/10",
+			},
+			want: []string{
+				EmojiApproved,
+				" · Ready to merge",
+				" · dave",
+			},
+		},
+		{
+			name: "multiple action users grouped by action",
 			params: ChannelMessageParams{
 				Owner:  "org",
 				Repo:   "repo",
@@ -89,13 +196,14 @@ func TestChannelMessage(t *testing.T) {
 				PRURL:  "https://github.com/org/repo/pull/1",
 				ActionUsers: []ActionUser{
 					{Username: "a", Mention: "<@1>", Action: "review"},
-					{Username: "b", Mention: "<@2>", Action: "approve"},
+					{Username: "b", Mention: "<@2>", Action: "review"},
 				},
 			},
 			want: []string{
 				"<@1>",
 				"<@2>",
-				", ",
+				"**review**",
+				", ", // Users with same action are comma-separated
 			},
 		},
 		{
@@ -202,36 +310,45 @@ func TestDMMessage(t *testing.T) {
 
 func TestStateFromAnalysis(t *testing.T) {
 	tests := []struct {
-		name          string
-		merged        bool
-		closed        bool
-		draft         bool
-		workflowState string
-		checksFailing int
-		mergeConflict bool
-		want          PRState
+		name   string
+		params StateAnalysisParams
+		want   PRState
 	}{
-		{"merged PR", true, false, false, "", 0, false, StateMerged},
-		{"closed PR", false, true, false, "", 0, false, StateClosed},
-		{"draft PR", false, false, true, "", 0, false, StateDraft},
-		{"merge conflict", false, false, false, "", 0, true, StateConflict},
-		{"failing checks", false, false, false, "", 2, false, StateTestsBroken},
-		{"in draft workflow", false, false, false, "IN_DRAFT", 0, false, StateDraft},
-		{"newly published", false, false, false, "NEWLY_PUBLISHED", 0, false, StateDraft},
-		{"waiting for tests", false, false, false, "PUBLISHED_WAITING_FOR_TESTS", 0, false, StateTestsRunning},
-		{"tests failed workflow", false, false, false, "TESTED_WAITING_FOR_FIXES", 0, false, StateTestsBroken},
-		{"needs refinement", false, false, false, "REVIEWED_NEEDS_REFINEMENT", 0, false, StateChanges},
-		{"approved", false, false, false, "APPROVED_WAITING_FOR_MERGE", 0, false, StateApproved},
-		{"waiting for assignment", false, false, false, "TESTED_WAITING_FOR_ASSIGNMENT", 0, false, StateNeedsReview},
-		{"waiting for review", false, false, false, "ASSIGNED_WAITING_FOR_REVIEW", 0, false, StateNeedsReview},
-		{"waiting for approval", false, false, false, "REFINED_WAITING_FOR_APPROVAL", 0, false, StateNeedsReview},
-		{"unknown workflow", false, false, false, "SOMETHING_ELSE", 0, false, StateUnknown},
-		{"empty workflow", false, false, false, "", 0, false, StateUnknown},
+		// Terminal states
+		{"merged PR", StateAnalysisParams{Merged: true}, StateMerged},
+		{"closed PR", StateAnalysisParams{Closed: true}, StateClosed},
+
+		// Draft shows as tests running (hourglass) to match slacker
+		{"draft PR", StateAnalysisParams{Draft: true}, StateTestsRunning},
+
+		// Merge conflicts
+		{"merge conflict", StateAnalysisParams{MergeConflict: true}, StateConflict},
+
+		// Check states
+		{"failing checks", StateAnalysisParams{ChecksFailing: 2}, StateTestsBroken},
+		{"pending checks", StateAnalysisParams{ChecksPending: 3}, StateTestsRunning},
+		{"waiting checks", StateAnalysisParams{ChecksWaiting: 1}, StateTestsRunning},
+		{"pending and waiting", StateAnalysisParams{ChecksPending: 2, ChecksWaiting: 1}, StateTestsRunning},
+
+		// Approved states (matches slacker logic)
+		{"approved no comments", StateAnalysisParams{Approved: true}, StateApproved},
+		{"approved with unresolved comments", StateAnalysisParams{Approved: true, UnresolvedComments: 2}, StateChanges},
+
+		// Workflow state fallbacks
+		{"newly published", StateAnalysisParams{WorkflowState: "NEWLY_PUBLISHED"}, StateNewlyPublished},
+		{"waiting for assignment", StateAnalysisParams{WorkflowState: "TESTED_WAITING_FOR_ASSIGNMENT"}, StateAwaitingAssign},
+		{"waiting for review", StateAnalysisParams{WorkflowState: "ASSIGNED_WAITING_FOR_REVIEW"}, StateNeedsReview},
+		{"waiting for approval", StateAnalysisParams{WorkflowState: "REFINED_WAITING_FOR_APPROVAL"}, StateNeedsReview},
+		{"needs refinement", StateAnalysisParams{WorkflowState: "REVIEWED_NEEDS_REFINEMENT"}, StateChanges},
+
+		// Default to awaiting review (matches slacker)
+		{"unknown workflow", StateAnalysisParams{WorkflowState: "SOMETHING_ELSE"}, StateNeedsReview},
+		{"empty workflow", StateAnalysisParams{}, StateNeedsReview},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := StateFromAnalysis(tt.merged, tt.closed, tt.draft, tt.workflowState, tt.checksFailing, tt.mergeConflict)
+			got := StateFromAnalysis(tt.params)
 			if got != tt.want {
 				t.Errorf("StateFromAnalysis() = %q, want %q", got, tt.want)
 			}

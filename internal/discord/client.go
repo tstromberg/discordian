@@ -68,40 +68,52 @@ func (c *Client) Session() *discordgo.Session {
 	return c.session
 }
 
-// PostMessage sends a plain text message to a channel.
+// PostMessage sends a plain text message to a channel with link embeds suppressed.
 func (c *Client) PostMessage(ctx context.Context, channelID, text string) (string, error) {
-	msg, err := c.session.ChannelMessageSend(channelID, text)
+	msg, err := c.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Content: text,
+		Flags:   discordgo.MessageFlagsSuppressEmbeds,
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to send message: %w", err)
 	}
 
-	slog.Debug("posted message",
+	slog.Info("posted channel message",
 		"channel_id", channelID,
 		"message_id", msg.ID,
-		"preview", format.Truncate(text, 50))
+		"content", text)
 
 	return msg.ID, nil
 }
 
 // UpdateMessage edits an existing message.
 func (c *Client) UpdateMessage(ctx context.Context, channelID, messageID, newText string) error {
-	_, err := c.session.ChannelMessageEdit(channelID, messageID, newText)
+	_, err := c.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
+		ID:      messageID,
+		Channel: channelID,
+		Content: &newText,
+		Flags:   discordgo.MessageFlagsSuppressEmbeds,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to edit message: %w", err)
 	}
 
-	slog.Debug("updated message",
+	slog.Info("updated channel message",
 		"channel_id", channelID,
-		"message_id", messageID)
+		"message_id", messageID,
+		"content", newText)
 
 	return nil
 }
 
-// PostForumThread creates a forum post with title and content.
+// PostForumThread creates a forum post with title and content, with link embeds suppressed.
 func (c *Client) PostForumThread(ctx context.Context, channelID, title, content string) (threadID, messageID string, err error) {
 	thread, err := c.session.ForumThreadStartComplex(channelID, &discordgo.ThreadStart{
 		Name: format.Truncate(title, 100), // Discord limits thread names
-	}, &discordgo.MessageSend{Content: content})
+	}, &discordgo.MessageSend{
+		Content: content,
+		Flags:   discordgo.MessageFlagsSuppressEmbeds,
+	})
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create forum thread: %w", err)
 	}
@@ -114,7 +126,8 @@ func (c *Client) PostForumThread(ctx context.Context, channelID, title, content 
 		"guild_id", guildID,
 		"channel_id", channelID,
 		"thread_id", thread.ID,
-		"title", title)
+		"title", title,
+		"content", content)
 
 	// Get the first message in the thread to return its ID
 	messages, err := c.session.ChannelMessages(thread.ID, 1, "", "", "")
@@ -135,15 +148,21 @@ func (c *Client) UpdateForumPost(ctx context.Context, threadID, messageID, newTi
 	}
 
 	if messageID != "" {
-		_, err = c.session.ChannelMessageEdit(threadID, messageID, newContent)
+		_, err = c.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
+			ID:      messageID,
+			Channel: threadID,
+			Content: &newContent,
+			Flags:   discordgo.MessageFlagsSuppressEmbeds,
+		})
 		if err != nil {
 			return fmt.Errorf("failed to update thread message: %w", err)
 		}
 	}
 
-	slog.Debug("updated forum post",
+	slog.Info("updated forum post",
 		"thread_id", threadID,
-		"new_title", newTitle)
+		"title", newTitle,
+		"content", newContent)
 
 	return nil
 }
@@ -162,32 +181,47 @@ func (c *Client) ArchiveThread(ctx context.Context, threadID string) error {
 	return nil
 }
 
-// SendDM sends a direct message to a user.
+// SendDM sends a direct message to a user with link embeds suppressed.
 func (c *Client) SendDM(ctx context.Context, userID, text string) (channelID, messageID string, err error) {
 	channel, err := c.session.UserChannelCreate(userID)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create DM channel: %w", err)
 	}
 
-	msg, err := c.session.ChannelMessageSend(channel.ID, text)
+	msg, err := c.session.ChannelMessageSendComplex(channel.ID, &discordgo.MessageSend{
+		Content: text,
+		Flags:   discordgo.MessageFlagsSuppressEmbeds,
+	})
 	if err != nil {
 		return "", "", fmt.Errorf("failed to send DM: %w", err)
 	}
 
-	slog.Debug("sent DM",
+	slog.Info("sent DM",
 		"user_id", userID,
 		"channel_id", channel.ID,
-		"message_id", msg.ID)
+		"message_id", msg.ID,
+		"content", text)
 
 	return channel.ID, msg.ID, nil
 }
 
 // UpdateDM updates an existing DM message.
 func (c *Client) UpdateDM(ctx context.Context, channelID, messageID, newText string) error {
-	_, err := c.session.ChannelMessageEdit(channelID, messageID, newText)
+	_, err := c.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
+		ID:      messageID,
+		Channel: channelID,
+		Content: &newText,
+		Flags:   discordgo.MessageFlagsSuppressEmbeds,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to update DM: %w", err)
 	}
+
+	slog.Info("updated DM",
+		"channel_id", channelID,
+		"message_id", messageID,
+		"content", newText)
+
 	return nil
 }
 
@@ -355,11 +389,24 @@ func (c *Client) IsUserInGuild(ctx context.Context, userID string) bool {
 	c.mu.RUnlock()
 
 	if guildID == "" {
+		slog.Debug("cannot check guild membership - no guild ID set",
+			"user_id", userID)
 		return false
 	}
 
 	_, err := c.session.GuildMember(guildID, userID)
-	return err == nil
+	if err != nil {
+		slog.Debug("user not found in guild",
+			"user_id", userID,
+			"guild_id", guildID,
+			"error", err)
+		return false
+	}
+
+	slog.Debug("user is guild member",
+		"user_id", userID,
+		"guild_id", guildID)
+	return true
 }
 
 // GuildInfo holds basic guild information.
@@ -414,4 +461,148 @@ func (c *Client) ChannelMessages(ctx context.Context, channelID string, limit in
 		return nil, fmt.Errorf("failed to fetch channel messages: %w", err)
 	}
 	return messages, nil
+}
+
+// FindForumThread searches for an existing forum thread by PR URL in the content.
+// Returns threadID, messageID if found.
+func (c *Client) FindForumThread(ctx context.Context, forumID, prURL string) (threadID, messageID string, found bool) {
+	// Get active threads in the forum
+	threads, err := c.session.GuildThreadsActive(c.guildID)
+	if err != nil {
+		slog.Debug("failed to fetch active threads", "forum_id", forumID, "error", err)
+		return "", "", false
+	}
+
+	for _, thread := range threads.Threads {
+		// Check if thread is in this forum
+		if thread.ParentID != forumID {
+			continue
+		}
+
+		// Get the first message to check content
+		messages, err := c.session.ChannelMessages(thread.ID, 1, "", "", "")
+		if err != nil || len(messages) == 0 {
+			continue
+		}
+
+		// Check if the message contains the PR URL
+		if strings.Contains(messages[0].Content, prURL) {
+			slog.Debug("found existing forum thread",
+				"forum_id", forumID,
+				"thread_id", thread.ID,
+				"pr_url", prURL)
+			return thread.ID, messages[0].ID, true
+		}
+	}
+
+	// Also check archived threads (recently archived)
+	archivedThreads, err := c.session.ThreadsArchived(forumID, nil, 50)
+	if err != nil {
+		slog.Debug("failed to fetch archived threads", "forum_id", forumID, "error", err)
+		return "", "", false
+	}
+
+	for _, thread := range archivedThreads.Threads {
+		messages, err := c.session.ChannelMessages(thread.ID, 1, "", "", "")
+		if err != nil || len(messages) == 0 {
+			continue
+		}
+
+		if strings.Contains(messages[0].Content, prURL) {
+			slog.Debug("found existing archived forum thread",
+				"forum_id", forumID,
+				"thread_id", thread.ID,
+				"pr_url", prURL)
+			return thread.ID, messages[0].ID, true
+		}
+	}
+
+	return "", "", false
+}
+
+// FindChannelMessage searches for an existing message containing the PR URL.
+// Returns messageID if found.
+func (c *Client) FindChannelMessage(ctx context.Context, channelID, prURL string) (messageID string, found bool) {
+	// Search recent messages (last 100)
+	messages, err := c.session.ChannelMessages(channelID, 100, "", "", "")
+	if err != nil {
+		slog.Debug("failed to fetch channel messages", "channel_id", channelID, "error", err)
+		return "", false
+	}
+
+	// Get bot's user ID
+	var botID string
+	if c.session.State != nil && c.session.State.User != nil {
+		botID = c.session.State.User.ID
+	}
+
+	for _, msg := range messages {
+		// Only check messages from the bot
+		if botID != "" && msg.Author.ID != botID {
+			continue
+		}
+
+		// Check if message contains the PR URL
+		if strings.Contains(msg.Content, prURL) {
+			slog.Debug("found existing channel message",
+				"channel_id", channelID,
+				"message_id", msg.ID,
+				"pr_url", prURL)
+			return msg.ID, true
+		}
+	}
+
+	return "", false
+}
+
+// FindDMForPR searches for an existing DM about a specific PR.
+// Returns channelID, messageID if found.
+func (c *Client) FindDMForPR(ctx context.Context, userID, prURL string) (channelID, messageID string, found bool) {
+	// Get or create DM channel
+	channel, err := c.session.UserChannelCreate(userID)
+	if err != nil {
+		slog.Debug("failed to get DM channel", "user_id", userID, "error", err)
+		return "", "", false
+	}
+
+	// Get bot's user ID
+	var botID string
+	if c.session.State != nil && c.session.State.User != nil {
+		botID = c.session.State.User.ID
+	}
+
+	// Search recent DMs (last 50)
+	messages, err := c.session.ChannelMessages(channel.ID, 50, "", "", "")
+	if err != nil {
+		slog.Debug("failed to fetch DM messages", "channel_id", channel.ID, "error", err)
+		return "", "", false
+	}
+
+	for _, msg := range messages {
+		// Only check messages from the bot
+		if botID != "" && msg.Author.ID != botID {
+			continue
+		}
+
+		// Check if message contains the PR URL
+		if strings.Contains(msg.Content, prURL) {
+			slog.Debug("found existing DM for PR",
+				"user_id", userID,
+				"channel_id", channel.ID,
+				"message_id", msg.ID,
+				"pr_url", prURL)
+			return channel.ID, msg.ID, true
+		}
+	}
+
+	return "", "", false
+}
+
+// GetMessageContent retrieves the content of a specific message.
+func (c *Client) GetMessageContent(ctx context.Context, channelID, messageID string) (string, error) {
+	msg, err := c.session.ChannelMessage(channelID, messageID)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch message: %w", err)
+	}
+	return msg.Content, nil
 }

@@ -6,6 +6,7 @@ require (
 	github.com/bwmarrin/discordgo v0.28.1
 	github.com/codeGROOVE-dev/fido v1.10.0
 	github.com/codeGROOVE-dev/fido/pkg/store/cloudrun v1.10.0
+	github.com/codeGROOVE-dev/fido/pkg/store/null v1.10.0
 	github.com/codeGROOVE-dev/gsm v0.0.0-20251019065141-833fe2363d22
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/go-github/v50 v50.2.0

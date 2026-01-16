@@ -146,23 +146,6 @@ func (s *MemoryStore) MarkProcessed(_ context.Context, eventKey string, _ time.D
 	return nil
 }
 
-// ClaimEvent atomically claims an event for processing.
-// Returns true if successfully claimed (first to claim), false if already claimed.
-func (s *MemoryStore) ClaimEvent(_ context.Context, eventKey string, _ time.Duration) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Check if already processed
-	processedAt, exists := s.processed[eventKey]
-	if exists && time.Since(processedAt) <= s.eventRetain {
-		return false, nil // Already claimed by another caller
-	}
-
-	// Claim it by marking as processed
-	s.processed[eventKey] = time.Now()
-	return true, nil
-}
-
 // QueuePendingDM adds a DM to the pending queue.
 func (s *MemoryStore) QueuePendingDM(ctx context.Context, dm *PendingDM) error {
 	s.mu.Lock()

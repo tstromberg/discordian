@@ -123,6 +123,7 @@ func TestChannelMessage(t *testing.T) {
 				EmojiTestsBroken,
 				" · Breaking change",
 				" · bob",
+				" • tests failing", // State text shown when no action users
 			},
 		},
 		{
@@ -140,10 +141,11 @@ func TestChannelMessage(t *testing.T) {
 				EmojiConflict,
 				" · Outdated branch",
 				" · charlie",
+				" • merge conflict", // State text shown when no action users
 			},
 		},
 		{
-			name: "with action users and state text",
+			name: "with action users (no state text shown)",
 			params: ChannelMessageParams{
 				Owner:  "org",
 				Repo:   "repo",
@@ -160,8 +162,7 @@ func TestChannelMessage(t *testing.T) {
 				EmojiChanges,
 				" · New feature",
 				" · bob",
-				" • changes requested",  // State text
-				"; **review** → <@123>", // Action users with semicolon separator
+				" • **review** → <@123>", // Action users only (no state text - matches Slacker)
 			},
 		},
 		{

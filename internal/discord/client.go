@@ -740,18 +740,45 @@ func (c *Client) FindChannelMessage(ctx context.Context, channelID, prURL string
 		botID = c.session.State.User.ID
 	}
 
-	for _, msg := range messages {
+	slog.Info("searching for existing channel message",
+		"channel_id", channelID,
+		"pr_url", prURL,
+		"bot_id", botID,
+		"messages_fetched", len(messages))
+
+	for i, msg := range messages {
+		// Log first 5 messages for debugging
+		if i < 5 {
+			preview := msg.Content
+			if len(preview) > 100 {
+				preview = preview[:100] + "..."
+			}
+			slog.Debug("checking message",
+				"index", i,
+				"message_id", msg.ID,
+				"author_id", msg.Author.ID,
+				"is_bot_message", botID != "" && msg.Author.ID == botID,
+				"content_preview", preview)
+		}
+
 		if botID != "" && msg.Author.ID != botID {
 			continue
 		}
 		if strings.Contains(msg.Content, prURL) {
-			slog.Debug("found existing channel message",
+			slog.Info("found existing channel message",
 				"channel_id", channelID,
 				"message_id", msg.ID,
+				"message_index", i,
 				"pr_url", prURL)
 			return msg.ID, true
 		}
 	}
+
+	slog.Warn("did not find existing channel message",
+		"channel_id", channelID,
+		"pr_url", prURL,
+		"bot_id", botID,
+		"messages_checked", len(messages))
 
 	return "", false
 }
@@ -805,7 +832,12 @@ func (c *Client) FindDMForPR(ctx context.Context, userID, prURL string) (channel
 
 // MessageContent retrieves the content of a specific message.
 func (c *Client) MessageContent(ctx context.Context, channelID, messageID string) (string, error) {
-	msg, err := c.session.ChannelMessage(channelID, messageID)
+	var msg *discordgo.Message
+	err := retryableCtx(ctx, func() error {
+		var err error
+		msg, err = c.session.ChannelMessage(channelID, messageID)
+		return err
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch message: %w", err)
 	}

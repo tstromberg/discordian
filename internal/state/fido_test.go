@@ -16,6 +16,7 @@ func newTestFidoStore(t *testing.T) *FidoStore {
 	store, err := NewFidoStore(ctx,
 		WithThreadStore(null.New[string, ThreadInfo]()),
 		WithDMStore(null.New[string, DMInfo]()),
+		WithDMUserStore(null.New[string, dmUserList]()),
 		WithReportStore(null.New[string, DailyReportInfo]()),
 		WithPendingStore(null.New[string, pendingDMQueue]()),
 		WithEventStore(null.New[string, time.Time]()),
@@ -260,12 +261,14 @@ func TestFidoStoreOptions(t *testing.T) {
 	// Test option functions don't panic
 	threadStore := null.New[string, ThreadInfo]()
 	dmStore := null.New[string, DMInfo]()
+	dmUserStore := null.New[string, dmUserList]()
 	reportStore := null.New[string, DailyReportInfo]()
 	pendingStore := null.New[string, pendingDMQueue]()
 
 	var opts fidoStoreOptions
 	WithThreadStore(threadStore)(&opts)
 	WithDMStore(dmStore)(&opts)
+	WithDMUserStore(dmUserStore)(&opts)
 	WithReportStore(reportStore)(&opts)
 	WithPendingStore(pendingStore)(&opts)
 
@@ -274,6 +277,9 @@ func TestFidoStoreOptions(t *testing.T) {
 	}
 	if opts.dmStore != dmStore {
 		t.Error("WithDMStore didn't set dmStore")
+	}
+	if opts.dmUserStore != dmUserStore {
+		t.Error("WithDMUserStore didn't set dmUserStore")
 	}
 	if opts.reportStore != reportStore {
 		t.Error("WithReportStore didn't set reportStore")

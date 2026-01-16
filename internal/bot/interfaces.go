@@ -64,7 +64,6 @@ type StateStore interface {
 	ListDMUsers(ctx context.Context, prURL string) []string // Returns all user IDs who received DMs for this PR
 	WasProcessed(ctx context.Context, eventKey string) bool
 	MarkProcessed(ctx context.Context, eventKey string, ttl time.Duration) error
-	ClaimEvent(ctx context.Context, eventKey string, ttl time.Duration) (bool, error)
 	QueuePendingDM(ctx context.Context, dm *state.PendingDM) error
 	PendingDMs(ctx context.Context, before time.Time) ([]*state.PendingDM, error)
 	RemovePendingDM(ctx context.Context, id string) error

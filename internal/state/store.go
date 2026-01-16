@@ -60,9 +60,6 @@ type Store interface {
 	// Event deduplication
 	WasProcessed(ctx context.Context, eventKey string) bool
 	MarkProcessed(ctx context.Context, eventKey string, ttl time.Duration) error
-	// ClaimEvent atomically claims an event for processing. Returns true if successfully claimed (first to claim),
-	// false if already claimed by another instance. This prevents duplicate processing across multiple instances.
-	ClaimEvent(ctx context.Context, eventKey string, ttl time.Duration) (bool, error)
 
 	// Pending DM queue
 	QueuePendingDM(ctx context.Context, dm *PendingDM) error

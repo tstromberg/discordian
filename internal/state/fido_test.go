@@ -503,3 +503,99 @@ func TestFidoStore_DMInfo_LastState(t *testing.T) {
 		t.Errorf("DMInfo().LastState = %q, want %q", got.LastState, "needs_review")
 	}
 }
+
+// TestFidoStore_ClaimThread tests thread claim locking with claim store.
+func TestFidoStore_ClaimThread(t *testing.T) {
+	ctx := context.Background()
+
+	// Create store with claim store
+	store, err := NewFidoStore(ctx,
+		WithThreadStore(null.New[string, ThreadInfo]()),
+		WithDMStore(null.New[string, DMInfo]()),
+		WithDMUserStore(null.New[string, dmUserList]()),
+		WithReportStore(null.New[string, DailyReportInfo]()),
+		WithPendingStore(null.New[string, pendingDMQueue]()),
+		WithEventStore(null.New[string, time.Time]()),
+		WithClaimStore(null.New[string, time.Time]()),
+	)
+	if err != nil {
+		t.Fatalf("NewFidoStore() error = %v", err)
+	}
+	defer store.Close() //nolint:errcheck // test cleanup
+
+	// First claim should succeed
+	if !store.ClaimThread(ctx, "owner", "repo", 1, "chan1", time.Second) {
+		t.Error("ClaimThread() should succeed on first attempt")
+	}
+
+	// Immediate second claim should fail (locked)
+	if store.ClaimThread(ctx, "owner", "repo", 1, "chan1", time.Second) {
+		t.Error("ClaimThread() should fail when already claimed")
+	}
+
+	// Different thread should succeed
+	if !store.ClaimThread(ctx, "owner", "repo", 2, "chan1", time.Second) {
+		t.Error("ClaimThread() should succeed for different PR")
+	}
+
+	// Wait for lock to expire
+	time.Sleep(1100 * time.Millisecond)
+
+	// Should be able to claim again after expiry
+	if !store.ClaimThread(ctx, "owner", "repo", 1, "chan1", time.Second) {
+		t.Error("ClaimThread() should succeed after lock expiry")
+	}
+}
+
+// TestFidoStore_ClaimDM tests DM claim locking with claim store.
+func TestFidoStore_ClaimDM(t *testing.T) {
+	ctx := context.Background()
+
+	// Create store with claim store
+	store, err := NewFidoStore(ctx,
+		WithThreadStore(null.New[string, ThreadInfo]()),
+		WithDMStore(null.New[string, DMInfo]()),
+		WithDMUserStore(null.New[string, dmUserList]()),
+		WithReportStore(null.New[string, DailyReportInfo]()),
+		WithPendingStore(null.New[string, pendingDMQueue]()),
+		WithEventStore(null.New[string, time.Time]()),
+		WithClaimStore(null.New[string, time.Time]()),
+	)
+	if err != nil {
+		t.Fatalf("NewFidoStore() error = %v", err)
+	}
+	defer store.Close() //nolint:errcheck // test cleanup
+
+	userID := "user123"
+	prURL := "https://github.com/owner/repo/pull/1"
+
+	// First claim should succeed
+	if !store.ClaimDM(ctx, userID, prURL, time.Second) {
+		t.Error("ClaimDM() should succeed on first attempt")
+	}
+
+	// Immediate second claim should fail (locked)
+	if store.ClaimDM(ctx, userID, prURL, time.Second) {
+		t.Error("ClaimDM() should fail when already claimed")
+	}
+
+	// Different PR should succeed
+	prURL2 := "https://github.com/owner/repo/pull/2"
+	if !store.ClaimDM(ctx, userID, prURL2, time.Second) {
+		t.Error("ClaimDM() should succeed for different PR")
+	}
+
+	// Different user should succeed
+	if !store.ClaimDM(ctx, "user456", prURL, time.Second) {
+		t.Error("ClaimDM() should succeed for different user")
+	}
+
+	// Wait for lock to expire
+	time.Sleep(1100 * time.Millisecond)
+
+	// Should be able to claim again after expiry
+	if !store.ClaimDM(ctx, userID, prURL, time.Second) {
+		t.Error("ClaimDM() should succeed after lock expiry")
+	}
+}
+

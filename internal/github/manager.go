@@ -74,12 +74,8 @@ func (m *Manager) RefreshInstallations(ctx context.Context) error {
 
 		foundOrgs[org] = true
 
-		// Skip if already have client for this org
-		if _, exists := m.clients[org]; exists {
-			continue
-		}
-
-		// Create client for this org
+		// Always recreate client to get fresh token
+		// GitHub App installation tokens expire after ~1 hour
 		ghClient, err := m.appClient.ClientForOrg(ctx, org)
 		if err != nil {
 			slog.Error("failed to create client for org",
@@ -88,6 +84,7 @@ func (m *Manager) RefreshInstallations(ctx context.Context) error {
 			continue
 		}
 
+		_, isNew := m.clients[org]
 		m.clients[org] = &OrgClient{
 			org:            org,
 			installationID: *inst.ID,
@@ -95,10 +92,16 @@ func (m *Manager) RefreshInstallations(ctx context.Context) error {
 			client:         ghClient,
 		}
 
-		slog.Info("discovered GitHub installation",
-			"org", org,
-			"installation_id", *inst.ID,
-			"account_type", accountType)
+		if !isNew {
+			slog.Debug("refreshed GitHub client with new token",
+				"org", org,
+				"installation_id", *inst.ID)
+		} else {
+			slog.Info("discovered GitHub installation",
+				"org", org,
+				"installation_id", *inst.ID,
+				"account_type", accountType)
+		}
 	}
 
 	// Remove clients for orgs that no longer have installations

@@ -324,3 +324,132 @@ func TestMemoryStore_DailyReportInfo(t *testing.T) {
 		t.Errorf("Updated DailyReportInfo().GuildID = %q, want %q", got.GuildID, newInfo.GuildID)
 	}
 }
+
+// TestMemoryStore_ClaimThread tests thread claim locking.
+func TestMemoryStore_ClaimThread(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	defer store.Close() //nolint:errcheck // test cleanup
+
+	// First claim should succeed
+	if !store.ClaimThread(ctx, "owner", "repo", 1, "chan1", time.Second) {
+		t.Error("ClaimThread() should succeed on first attempt")
+	}
+
+	// Immediate second claim should fail (locked)
+	if store.ClaimThread(ctx, "owner", "repo", 1, "chan1", time.Second) {
+		t.Error("ClaimThread() should fail when already claimed")
+	}
+
+	// Different thread should succeed
+	if !store.ClaimThread(ctx, "owner", "repo", 2, "chan1", time.Second) {
+		t.Error("ClaimThread() should succeed for different PR")
+	}
+
+	// Wait for lock to expire
+	time.Sleep(1100 * time.Millisecond)
+
+	// Should be able to claim again after expiry
+	if !store.ClaimThread(ctx, "owner", "repo", 1, "chan1", time.Second) {
+		t.Error("ClaimThread() should succeed after lock expiry")
+	}
+}
+
+// TestMemoryStore_ClaimDM tests DM claim locking.
+func TestMemoryStore_ClaimDM(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	defer store.Close() //nolint:errcheck // test cleanup
+
+	userID := "user123"
+	prURL := "https://github.com/owner/repo/pull/1"
+
+	// First claim should succeed
+	if !store.ClaimDM(ctx, userID, prURL, time.Second) {
+		t.Error("ClaimDM() should succeed on first attempt")
+	}
+
+	// Immediate second claim should fail (locked)
+	if store.ClaimDM(ctx, userID, prURL, time.Second) {
+		t.Error("ClaimDM() should fail when already claimed")
+	}
+
+	// Different PR should succeed
+	prURL2 := "https://github.com/owner/repo/pull/2"
+	if !store.ClaimDM(ctx, userID, prURL2, time.Second) {
+		t.Error("ClaimDM() should succeed for different PR")
+	}
+
+	// Different user should succeed
+	if !store.ClaimDM(ctx, "user456", prURL, time.Second) {
+		t.Error("ClaimDM() should succeed for different user")
+	}
+
+	// Wait for lock to expire
+	time.Sleep(1100 * time.Millisecond)
+
+	// Should be able to claim again after expiry
+	if !store.ClaimDM(ctx, userID, prURL, time.Second) {
+		t.Error("ClaimDM() should succeed after lock expiry")
+	}
+}
+
+// TestMemoryStore_ListDMUsers tests listing users with DMs for a PR.
+func TestMemoryStore_ListDMUsers(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	defer store.Close() //nolint:errcheck // test cleanup
+
+	prURL := "https://github.com/owner/repo/pull/1"
+
+	// Initially empty
+	users := store.ListDMUsers(ctx, prURL)
+	if len(users) != 0 {
+		t.Errorf("ListDMUsers() returned %d users, want 0", len(users))
+	}
+
+	// Save DM info for two users
+	dm1 := DMInfo{ChannelID: "chan1", MessageID: "msg1", SentAt: time.Now()}
+	if err := store.SaveDMInfo(ctx, "user1", prURL, dm1); err != nil {
+		t.Fatalf("SaveDMInfo(user1) error = %v", err)
+	}
+
+	dm2 := DMInfo{ChannelID: "chan2", MessageID: "msg2", SentAt: time.Now()}
+	if err := store.SaveDMInfo(ctx, "user2", prURL, dm2); err != nil {
+		t.Fatalf("SaveDMInfo(user2) error = %v", err)
+	}
+
+	// Different PR for same user
+	prURL2 := "https://github.com/owner/repo/pull/2"
+	dm3 := DMInfo{ChannelID: "chan3", MessageID: "msg3", SentAt: time.Now()}
+	if err := store.SaveDMInfo(ctx, "user1", prURL2, dm3); err != nil {
+		t.Fatalf("SaveDMInfo(user1, pr2) error = %v", err)
+	}
+
+	// Should get two users for first PR
+	users = store.ListDMUsers(ctx, prURL)
+	if len(users) != 2 {
+		t.Fatalf("ListDMUsers() returned %d users, want 2", len(users))
+	}
+
+	// Check both users are present
+	userMap := make(map[string]bool)
+	for _, u := range users {
+		userMap[u] = true
+	}
+	if !userMap["user1"] {
+		t.Error("ListDMUsers() should include user1")
+	}
+	if !userMap["user2"] {
+		t.Error("ListDMUsers() should include user2")
+	}
+
+	// Only one user for second PR
+	users = store.ListDMUsers(ctx, prURL2)
+	if len(users) != 1 {
+		t.Fatalf("ListDMUsers(pr2) returned %d users, want 1", len(users))
+	}
+	if users[0] != "user1" {
+		t.Errorf("ListDMUsers(pr2)[0] = %q, want user1", users[0])
+	}
+}

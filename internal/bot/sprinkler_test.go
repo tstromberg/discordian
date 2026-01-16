@@ -224,3 +224,142 @@ func TestTurnHTTPClient_Check_ContextCanceled(t *testing.T) {
 		t.Error("expected error for canceled context")
 	}
 }
+
+func TestParsePRURL_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name      string
+		url       string
+		wantValid bool
+		wantOwner string
+		wantRepo  string
+		wantNum   int
+	}{
+		{
+			name:      "valid PR URL",
+			url:       "https://github.com/owner/repo/pull/123",
+			wantValid: true,
+			wantOwner: "owner",
+			wantRepo:  "repo",
+			wantNum:   123,
+		},
+		{
+			name:      "http scheme",
+			url:       "http://github.com/owner/repo/pull/123",
+			wantValid: false,
+		},
+		{
+			name:      "wrong host",
+			url:       "https://gitlab.com/owner/repo/pull/123",
+			wantValid: false,
+		},
+		{
+			name:      "missing pull segment",
+			url:       "https://github.com/owner/repo/issues/123",
+			wantValid: false,
+		},
+		{
+			name:      "invalid PR number",
+			url:       "https://github.com/owner/repo/pull/abc",
+			wantValid: false,
+		},
+		{
+			name:      "zero PR number",
+			url:       "https://github.com/owner/repo/pull/0",
+			wantValid: false,
+		},
+		{
+			name:      "negative PR number",
+			url:       "https://github.com/owner/repo/pull/-1",
+			wantValid: false,
+		},
+		{
+			name:      "path traversal in owner",
+			url:       "https://github.com/../evil/repo/pull/123",
+			wantValid: false,
+		},
+		{
+			name:      "path traversal in repo",
+			url:       "https://github.com/owner/../evil/pull/123",
+			wantValid: false,
+		},
+		{
+			name:      "invalid owner name",
+			url:       "https://github.com/owner@evil/repo/pull/123",
+			wantValid: false,
+		},
+		{
+			name:      "empty URL",
+			url:       "",
+			wantValid: false,
+		},
+		{
+			name:      "malformed URL",
+			url:       "not a url",
+			wantValid: false,
+		},
+		{
+			name:      "too few path segments",
+			url:       "https://github.com/owner/repo",
+			wantValid: false,
+		},
+		{
+			name:      "too many path segments",
+			url:       "https://github.com/owner/repo/pull/123/extra",
+			wantValid: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info, valid := ParsePRURL(tt.url)
+			if valid != tt.wantValid {
+				t.Errorf("ParsePRURL(%q) valid = %v, want %v", tt.url, valid, tt.wantValid)
+			}
+			if valid {
+				if info.Owner != tt.wantOwner {
+					t.Errorf("Owner = %q, want %q", info.Owner, tt.wantOwner)
+				}
+				if info.Repo != tt.wantRepo {
+					t.Errorf("Repo = %q, want %q", info.Repo, tt.wantRepo)
+				}
+				if info.Number != tt.wantNum {
+					t.Errorf("Number = %d, want %d", info.Number, tt.wantNum)
+				}
+			}
+		})
+	}
+}
+
+func TestFormatPRURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		owner  string
+		repo   string
+		number int
+		want   string
+	}{
+		{
+			name:   "basic PR",
+			owner:  "owner",
+			repo:   "repo",
+			number: 123,
+			want:   "https://github.com/owner/repo/pull/123",
+		},
+		{
+			name:   "PR number 1",
+			owner:  "org",
+			repo:   "project",
+			number: 1,
+			want:   "https://github.com/org/project/pull/1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FormatPRURL(tt.owner, tt.repo, tt.number)
+			if got != tt.want {
+				t.Errorf("FormatPRURL(%q, %q, %d) = %q, want %q", tt.owner, tt.repo, tt.number, got, tt.want)
+			}
+		})
+	}
+}

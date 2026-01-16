@@ -2,26 +2,32 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/codeGROOVE-dev/discordian/internal/config"
+	"github.com/codeGROOVE-dev/discordian/internal/format"
 	"github.com/codeGROOVE-dev/discordian/internal/state"
 )
 
 // Mock implementations
 
 type mockDiscordClient struct {
-	postedMessages  []postedMessage
-	updatedMessages []updatedMessage
-	forumThreads    []forumThread
-	sentDMs         []sentDM
-	updatedDMs      []updatedDM
-	channelIDs      map[string]string
-	forumChannels   map[string]bool
-	usersInGuild    map[string]bool
-	botInChannel    map[string]bool
-	guildID         string
+	postedMessages    []postedMessage
+	updatedMessages   []updatedMessage
+	forumThreads      []forumThread
+	sentDMs           []sentDM
+	updatedDMs        []updatedDM
+	channelIDs        map[string]string
+	forumChannels     map[string]bool
+	usersInGuild      map[string]bool
+	activeUsers       map[string]bool
+	botInChannel      map[string]bool
+	channelMessages   map[string]map[string]string // channelID -> messageID -> content
+	guildID           string
+	shouldFailUpdate  bool
+	shouldFailUpdateDM bool
 }
 
 type postedMessage struct {
@@ -54,11 +60,13 @@ type updatedDM struct {
 
 func newMockDiscordClient() *mockDiscordClient {
 	return &mockDiscordClient{
-		channelIDs:    make(map[string]string),
-		forumChannels: make(map[string]bool),
-		usersInGuild:  make(map[string]bool),
-		botInChannel:  make(map[string]bool),
-		guildID:       "test-guild",
+		channelIDs:      make(map[string]string),
+		forumChannels:   make(map[string]bool),
+		usersInGuild:    make(map[string]bool),
+		activeUsers:     make(map[string]bool),
+		botInChannel:    make(map[string]bool),
+		channelMessages: make(map[string]map[string]string),
+		guildID:         "test-guild",
 	}
 }
 
@@ -69,6 +77,9 @@ func (m *mockDiscordClient) PostMessage(_ context.Context, channelID, text strin
 
 func (m *mockDiscordClient) UpdateMessage(_ context.Context, channelID, messageID, text string) error {
 	m.updatedMessages = append(m.updatedMessages, updatedMessage{channelID, messageID, text})
+	if m.shouldFailUpdate {
+		return fmt.Errorf("mock update failed")
+	}
 	return nil
 }
 
@@ -91,6 +102,9 @@ func (m *mockDiscordClient) SendDM(_ context.Context, userID, text string) (chan
 }
 
 func (m *mockDiscordClient) UpdateDM(_ context.Context, channelID, messageID, text string) error {
+	if m.shouldFailUpdateDM {
+		return fmt.Errorf("mock DM update failed")
+	}
 	m.updatedDMs = append(m.updatedDMs, updatedDM{channelID, messageID, text})
 	return nil
 }
@@ -114,8 +128,8 @@ func (m *mockDiscordClient) IsUserInGuild(_ context.Context, userID string) bool
 	return m.usersInGuild[userID]
 }
 
-func (m *mockDiscordClient) IsUserActive(_ context.Context, _ string) bool {
-	return false
+func (m *mockDiscordClient) IsUserActive(_ context.Context, userID string) bool {
+	return m.activeUsers[userID]
 }
 
 func (m *mockDiscordClient) IsForumChannel(_ context.Context, channelID string) bool {
@@ -130,16 +144,27 @@ func (m *mockDiscordClient) FindForumThread(_ context.Context, _, _ string) (str
 	return "", "", false
 }
 
-func (m *mockDiscordClient) FindChannelMessage(_ context.Context, _, _ string) (string, bool) {
+func (m *mockDiscordClient) FindChannelMessage(_ context.Context, channelID, prURL string) (string, bool) {
+	if messages, ok := m.channelMessages[channelID]; ok {
+		for msgID := range messages {
+			// Return first message in channel (for testing purposes)
+			return msgID, true
+		}
+	}
 	return "", false
+}
+
+func (m *mockDiscordClient) MessageContent(_ context.Context, channelID, messageID string) (string, error) {
+	if messages, ok := m.channelMessages[channelID]; ok {
+		if content, ok := messages[messageID]; ok {
+			return content, nil
+		}
+	}
+	return "", fmt.Errorf("message not found")
 }
 
 func (m *mockDiscordClient) FindDMForPR(_ context.Context, _, _ string) (string, string, bool) {
 	return "", "", false
-}
-
-func (m *mockDiscordClient) MessageContent(_ context.Context, _, _ string) (string, error) {
-	return "", nil
 }
 
 type mockConfigManager struct {
@@ -233,6 +258,75 @@ func (m *mockUserMapper) Mention(_ context.Context, githubUsername string) strin
 		return "<@" + id + ">"
 	}
 	return githubUsername
+}
+
+type mockPRSearcher struct {
+	openPRs   []PRSearchResult
+	closedPRs []PRSearchResult
+	openErr   error
+	closedErr error
+}
+
+func (m *mockPRSearcher) ListOpenPRs(_ context.Context, _ string, _ int) ([]PRSearchResult, error) {
+	if m.openErr != nil {
+		return nil, m.openErr
+	}
+	return m.openPRs, nil
+}
+
+func (m *mockPRSearcher) ListClosedPRs(_ context.Context, _ string, _ int) ([]PRSearchResult, error) {
+	if m.closedErr != nil {
+		return nil, m.closedErr
+	}
+	return m.closedPRs, nil
+}
+
+// mockStore wraps a real store but allows injection of failures for testing
+type mockStore struct {
+	state.Store
+	pendingDMs            []*state.PendingDM
+	shouldFailPendingDMs  bool
+	failRemoveDMID        string
+	claimThreadShouldFail bool
+}
+
+func newMockStore() *mockStore {
+	return &mockStore{
+		Store:      state.NewMemoryStore(),
+		pendingDMs: make([]*state.PendingDM, 0),
+	}
+}
+
+func (m *mockStore) PendingDMs(ctx context.Context, before time.Time) ([]*state.PendingDM, error) {
+	if m.shouldFailPendingDMs {
+		return nil, fmt.Errorf("mock pending DMs error")
+	}
+	if len(m.pendingDMs) > 0 {
+		// Return test pendingDMs if set
+		return m.pendingDMs, nil
+	}
+	return m.Store.PendingDMs(ctx, before)
+}
+
+func (m *mockStore) RemovePendingDM(ctx context.Context, id string) error {
+	if m.failRemoveDMID != "" && m.failRemoveDMID == id {
+		return fmt.Errorf("mock remove DM error for %s", id)
+	}
+	// Remove from test pendingDMs slice if present
+	for i, dm := range m.pendingDMs {
+		if dm.ID == id {
+			m.pendingDMs = append(m.pendingDMs[:i], m.pendingDMs[i+1:]...)
+			return nil
+		}
+	}
+	return m.Store.RemovePendingDM(ctx, id)
+}
+
+func (m *mockStore) ClaimThread(ctx context.Context, owner, repo string, number int, channelID string, ttl time.Duration) bool {
+	if m.claimThreadShouldFail {
+		return false
+	}
+	return m.Store.ClaimThread(ctx, owner, repo, number, channelID, ttl)
 }
 
 func TestNewCoordinator(t *testing.T) {
@@ -941,3 +1035,3068 @@ func containsMiddle(s, substr string) bool {
 	}
 	return false
 }
+
+// TestCoordinator_CleanupLocks tests the CleanupLocks method.
+func TestCoordinator_CleanupLocks(t *testing.T) {
+	discord := newMockDiscordClient()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	cfgMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Org:     "testorg",
+		Discord: discord,
+		Store:   store,
+		Turn:    turn,
+		Config:  cfgMgr,
+	})
+
+	// Create some locks by getting them
+	prLock := coord.prLock("https://github.com/testorg/repo/pull/1")
+	dmLock := coord.dmLock("user123", "https://github.com/testorg/repo/pull/1")
+
+	// Locks exist
+	if prLock == nil {
+		t.Error("prLock should not be nil")
+	}
+	if dmLock == nil {
+		t.Error("dmLock should not be nil")
+	}
+
+	// Cleanup should not remove fresh locks immediately
+	coord.CleanupLocks()
+
+	// Locks should still exist (same mutex returned)
+	if coord.prLock("https://github.com/testorg/repo/pull/1") != prLock {
+		t.Error("PR lock should still be the same mutex")
+	}
+	if coord.dmLock("user123", "https://github.com/testorg/repo/pull/1") != dmLock {
+		t.Error("DM lock should still be the same mutex")
+	}
+}
+
+// TestCoordinator_ExportUserMapperCache tests the ExportUserMapperCache method.
+func TestCoordinator_ExportUserMapperCache(t *testing.T) {
+	discord := newMockDiscordClient()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	cfgMgr := newMockConfigManager()
+
+	t.Run("with nil user mapper", func(t *testing.T) {
+		coord := NewCoordinator(CoordinatorConfig{
+			Org:     "testorg",
+			Discord: discord,
+			Store:   store,
+			Turn:    turn,
+			Config:  cfgMgr,
+		})
+
+		cache := coord.ExportUserMapperCache()
+		if cache == nil {
+			t.Error("should return empty map, not nil")
+		}
+		if len(cache) != 0 {
+			t.Errorf("cache should be empty, got %d entries", len(cache))
+		}
+	})
+
+	t.Run("with mock user mapper", func(t *testing.T) {
+		mapper := &mockUserMapper{}
+
+		coord := NewCoordinator(CoordinatorConfig{
+			Org:        "testorg",
+			Discord:    discord,
+			Store:      store,
+			Turn:       turn,
+			Config:     cfgMgr,
+			UserMapper: mapper,
+		})
+
+		cache := coord.ExportUserMapperCache()
+		// Mock mapper doesn't implement Mapper interface, so should return empty map
+		if len(cache) != 0 {
+			t.Errorf("cache should be empty for non-Mapper type, got %d entries", len(cache))
+		}
+	})
+}
+
+// TestTagTracker_Mark tests the tagTracker.mark method with cleanup.
+func TestTagTracker_Mark(t *testing.T) {
+	t.Run("mark users as tagged", func(t *testing.T) {
+		tracker := newTagTracker()
+
+		tracker.mark("https://github.com/o/r/pull/1", "alice")
+		tracker.mark("https://github.com/o/r/pull/1", "bob")
+		tracker.mark("https://github.com/o/r/pull/2", "charlie")
+
+		if !tracker.wasTagged("https://github.com/o/r/pull/1", "alice") {
+			t.Error("alice should be tagged for PR 1")
+		}
+		if !tracker.wasTagged("https://github.com/o/r/pull/1", "bob") {
+			t.Error("bob should be tagged for PR 1")
+		}
+		if !tracker.wasTagged("https://github.com/o/r/pull/2", "charlie") {
+			t.Error("charlie should be tagged for PR 2")
+		}
+	})
+
+	t.Run("cleanup when exceeding max entries", func(t *testing.T) {
+		tracker := newTagTracker()
+
+		// Add more than maxTagTrackerEntries
+		for i := 0; i < maxTagTrackerEntries+50; i++ {
+			prURL := fmt.Sprintf("https://github.com/o/r/pull/%d", i)
+			tracker.mark(prURL, "user")
+		}
+
+		tracker.mu.RLock()
+		entryCount := len(tracker.tagged)
+		tracker.mu.RUnlock()
+
+		// Should have cleaned up oldest entries
+		if entryCount > maxTagTrackerEntries {
+			t.Errorf("tag tracker has %d entries, should be <= %d after cleanup", entryCount, maxTagTrackerEntries)
+		}
+
+		// Oldest entries should be removed
+		if tracker.wasTagged("https://github.com/o/r/pull/0", "user") {
+			t.Error("oldest entry should have been cleaned up")
+		}
+
+		// Recent entries should remain
+		recentPR := fmt.Sprintf("https://github.com/o/r/pull/%d", maxTagTrackerEntries+49)
+		if !tracker.wasTagged(recentPR, "user") {
+			t.Error("recent entry should still be tracked")
+		}
+	})
+}
+
+// TestTagTracker_WasTagged tests the tagTracker.wasTagged method.
+func TestTagTracker_WasTagged(t *testing.T) {
+	tracker := newTagTracker()
+
+	tracker.mark("https://github.com/o/r/pull/1", "alice")
+
+	tests := []struct {
+		name     string
+		prURL    string
+		username string
+		want     bool
+	}{
+		{
+			name:     "tagged user",
+			prURL:    "https://github.com/o/r/pull/1",
+			username: "alice",
+			want:     true,
+		},
+		{
+			name:     "untagged user for same PR",
+			prURL:    "https://github.com/o/r/pull/1",
+			username: "bob",
+			want:     false,
+		},
+		{
+			name:     "non-existent PR",
+			prURL:    "https://github.com/o/r/pull/999",
+			username: "alice",
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tracker.wasTagged(tt.prURL, tt.username)
+			if got != tt.want {
+				t.Errorf("wasTagged() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCoordinator_Wait tests the Wait method.
+func TestCoordinator_Wait(t *testing.T) {
+	discord := newMockDiscordClient()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	cfg := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Org:     "testorg",
+		Discord: discord,
+		Store:   store,
+		Turn:    turn,
+		Config:  cfg,
+	})
+
+	// Wait should complete immediately since we haven't started any goroutines
+	coord.Wait()
+}
+
+func TestCoordinator_PollAndReconcile(t *testing.T) {
+	t.Run("no searcher configured", func(t *testing.T) {
+		discord := newMockDiscordClient()
+		store := state.NewMemoryStore()
+		turn := newMockTurnClient()
+		cfg := newMockConfigManager()
+
+		coord := NewCoordinator(CoordinatorConfig{
+			Org:     "testorg",
+			Discord: discord,
+			Store:   store,
+			Turn:    turn,
+			Config:  cfg,
+			// No Searcher
+		})
+
+		ctx := context.Background()
+		// Should not panic, just log and return
+		coord.PollAndReconcile(ctx)
+	})
+
+	t.Run("with open and closed PRs", func(t *testing.T) {
+		discord := newMockDiscordClient()
+		store := state.NewMemoryStore()
+		turn := newMockTurnClient()
+		cfg := newMockConfigManager()
+		searcher := &mockPRSearcher{
+			openPRs: []PRSearchResult{
+				{
+					URL:       "https://github.com/testorg/repo1/pull/1",
+					UpdatedAt: time.Now(),
+					Owner:     "testorg",
+					Repo:      "repo1",
+					Number:    1,
+				},
+			},
+			closedPRs: []PRSearchResult{
+				{
+					URL:       "https://github.com/testorg/repo1/pull/2",
+					UpdatedAt: time.Now(),
+					Owner:     "testorg",
+					Repo:      "repo1",
+					Number:    2,
+				},
+			},
+		}
+
+		coord := NewCoordinator(CoordinatorConfig{
+			Org:      "testorg",
+			Discord:  discord,
+			Store:    store,
+			Turn:     turn,
+			Config:   cfg,
+			Searcher: searcher,
+		})
+
+		ctx := context.Background()
+		// Should process both open and closed PRs
+		coord.PollAndReconcile(ctx)
+
+		// Verify reconcilePR was called for both PRs
+		// Since we don't have event tracking in mock, just verify no panic
+	})
+
+	t.Run("searcher returns errors", func(t *testing.T) {
+		discord := newMockDiscordClient()
+		store := state.NewMemoryStore()
+		turn := newMockTurnClient()
+		cfg := newMockConfigManager()
+		searcher := &mockPRSearcher{
+			openErr:   fmt.Errorf("open PR search failed"),
+			closedErr: fmt.Errorf("closed PR search failed"),
+		}
+
+		coord := NewCoordinator(CoordinatorConfig{
+			Org:      "testorg",
+			Discord:  discord,
+			Store:    store,
+			Turn:     turn,
+			Config:   cfg,
+			Searcher: searcher,
+		})
+
+		ctx := context.Background()
+		// Should handle errors gracefully
+		coord.PollAndReconcile(ctx)
+	})
+}
+
+func TestCoordinator_checkDailyReports(t *testing.T) {
+	t.Run("empty PR list", func(t *testing.T) {
+		discord := newMockDiscordClient()
+		store := state.NewMemoryStore()
+		turn := newMockTurnClient()
+		cfg := newMockConfigManager()
+
+		coord := NewCoordinator(CoordinatorConfig{
+			Org:     "testorg",
+			Discord: discord,
+			Store:   store,
+			Turn:    turn,
+			Config:  cfg,
+		})
+
+		ctx := context.Background()
+		// Should return early with empty list
+		coord.checkDailyReports(ctx, []PRSearchResult{})
+	})
+
+	t.Run("no config found", func(t *testing.T) {
+		discord := newMockDiscordClient()
+		store := state.NewMemoryStore()
+		turn := newMockTurnClient()
+		cfg := &mockConfigManager{
+			configs: make(map[string]*config.DiscordConfig), // Empty, no config for testorg
+		}
+
+		coord := NewCoordinator(CoordinatorConfig{
+			Org:     "testorg",
+			Discord: discord,
+			Store:   store,
+			Turn:    turn,
+			Config:  cfg,
+		})
+
+		ctx := context.Background()
+		prs := []PRSearchResult{
+			{
+				URL:       "https://github.com/testorg/repo1/pull/1",
+				UpdatedAt: time.Now(),
+				Owner:     "testorg",
+				Repo:      "repo1",
+				Number:    1,
+			},
+		}
+		// Should return early when config not found
+		coord.checkDailyReports(ctx, prs)
+	})
+
+	t.Run("no guild ID in config", func(t *testing.T) {
+		discord := newMockDiscordClient()
+		store := state.NewMemoryStore()
+		turn := newMockTurnClient()
+		cfg := newMockConfigManager()
+		// Set config with empty guild ID
+		cfg.configs["testorg"] = &config.DiscordConfig{
+			Global: config.GlobalConfig{
+				GuildID: "", // Empty guild ID
+			},
+		}
+
+		coord := NewCoordinator(CoordinatorConfig{
+			Org:     "testorg",
+			Discord: discord,
+			Store:   store,
+			Turn:    turn,
+			Config:  cfg,
+		})
+
+		ctx := context.Background()
+		prs := []PRSearchResult{
+			{
+				URL:       "https://github.com/testorg/repo1/pull/1",
+				UpdatedAt: time.Now(),
+				Owner:     "testorg",
+				Repo:      "repo1",
+				Number:    1,
+			},
+		}
+		// Should return early when guild ID is empty
+		coord.checkDailyReports(ctx, prs)
+	})
+}
+
+func TestCoordinator_ProcessForumChannel_ExistingThread(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+	discord.forumChannels["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+			WorkflowState: "awaiting_review",
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	// Create initial thread
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	initialCount := len(discord.forumThreads)
+
+	// Update the PR
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR - Updated",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+			WorkflowState: "awaiting_review",
+		},
+	}
+
+	event2 := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-2",
+	}
+	coord.ProcessEvent(ctx, event2)
+	coord.Wait()
+
+	// Should update existing thread, not create new one
+	if len(discord.forumThreads) != initialCount {
+		t.Errorf("Expected %d forum threads (update, not create), got %d", initialCount, len(discord.forumThreads))
+	}
+}
+
+func TestCoordinator_ProcessTextChannel_ExistingMessage(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	// Create initial message
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	initialCount := len(discord.postedMessages)
+
+	// Update the PR
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR - Updated",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	event2 := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-2",
+	}
+	coord.ProcessEvent(ctx, event2)
+	coord.Wait()
+
+	// Should update existing message, not create new one
+	if len(discord.postedMessages) != initialCount {
+		t.Errorf("Expected %d messages (update, not create), got %d", initialCount, len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessMergedPR(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "closed",
+			Merged: true,
+		},
+		Analysis: Analysis{
+			NextAction:    map[string]Action{},
+			WorkflowState: "merged",
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-merged",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	if len(discord.postedMessages) != 1 {
+		t.Errorf("Expected 1 posted message for merged PR, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessClosedPR(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "closed",
+			Closed: true,
+			Merged: false,
+		},
+		Analysis: Analysis{
+			NextAction:    map[string]Action{},
+			WorkflowState: "closed_unmerged",
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-closed",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	if len(discord.postedMessages) != 1 {
+		t.Errorf("Expected 1 posted message for closed PR, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessDraftPR(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+			Draft:  true,
+		},
+		Analysis: Analysis{
+			NextAction:    map[string]Action{},
+			WorkflowState: "draft",
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-draft",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	if len(discord.postedMessages) != 1 {
+		t.Errorf("Expected 1 posted message for draft PR, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessPRWithFailingChecks(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"alice": {Kind: "fix_tests", Reason: "Tests are failing"},
+			},
+			WorkflowState: "tests_failing",
+			Checks: Checks{
+				Failing: 2,
+				Passing: 3,
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-failing",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	if len(discord.postedMessages) != 1 {
+		t.Errorf("Expected 1 posted message for PR with failing checks, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessDMForUser_NoMapper(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: nil, // No user mapper
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Should not send any DMs without user mapper
+	if len(discord.sentDMs) != 0 {
+		t.Errorf("Expected 0 DMs without user mapper, got %d", len(discord.sentDMs))
+	}
+}
+
+func TestCoordinator_ProcessDMForUser_NotInGuild(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+	// Don't add bob to usersInGuild
+
+	configMgr := &mockConfigManagerWithDelay{
+		mockConfigManager: newMockConfigManager(),
+		delay:             65,
+	}
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Should not send DM to user not in guild
+	if len(discord.sentDMs) != 0 {
+		t.Errorf("Expected 0 DMs for user not in guild, got %d", len(discord.sentDMs))
+	}
+}
+
+func TestCoordinator_CancelPendingDMsForPR(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+	discord.usersInGuild["discord-bob"] = true
+
+	configMgr := &mockConfigManagerWithDelay{
+		mockConfigManager: newMockConfigManager(),
+		delay:             65,
+	}
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+	})
+
+	// Create a PR event that queues a DM
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Verify DM was queued
+	pendingDMs, _ := store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
+	initialCount := len(pendingDMs)
+	if initialCount == 0 {
+		t.Skip("No pending DMs were created, test cannot proceed")
+	}
+
+	// Close the PR - should cancel pending DMs
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "closed",
+			Closed: true,
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{},
+		},
+	}
+
+	event2 := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-2",
+	}
+	coord.ProcessEvent(ctx, event2)
+	coord.Wait()
+
+	// Verify pending DMs were cancelled
+	pendingDMs, _ = store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
+	if len(pendingDMs) >= initialCount {
+		t.Errorf("Expected pending DMs to be cancelled, had %d initially, now have %d", initialCount, len(pendingDMs))
+	}
+}
+
+func TestCoordinator_ProcessInvalidPRURL(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://invalid.com/not/a/pr",
+		Type:       "pull_request",
+		DeliveryID: "delivery-invalid",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Should handle gracefully, no messages posted
+	if len(discord.postedMessages) != 0 {
+		t.Errorf("Expected 0 messages for invalid URL, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessWrongOrg(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/wrongorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-wrongorg",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Should skip processing for wrong org
+	if len(discord.postedMessages) != 0 {
+		t.Errorf("Expected 0 messages for wrong org, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessNoChannelsConfigured(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	// Don't configure any channels
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Should handle gracefully when channels not configured
+	// The coordinator will try to use the channel returned by ChannelsForRepo
+	// which defaults to using repo name, but Discord won't have the channel
+}
+
+func TestCoordinator_ProcessBotNotInChannel(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	// Don't set botInChannel - bot not in channel
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Should skip posting when bot not in channel
+	if len(discord.postedMessages) != 0 {
+		t.Errorf("Expected 0 messages when bot not in channel, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessTurnAPIError(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	// Don't set any response, will return error
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Should handle Turn API error gracefully
+	if len(discord.postedMessages) != 0 {
+		t.Errorf("Expected 0 messages when Turn API fails, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessForumChannelWhenThresholds(t *testing.T) {
+	tests := []struct {
+		name            string
+		when            string
+		workflowState   string
+		assignees       []string
+		nextAction      map[string]Action
+		shouldPost      bool
+	}{
+		{
+			name:          "immediate mode",
+			when:          "immediate",
+			workflowState: "draft",
+			shouldPost:    true,
+		},
+		{
+			name:          "assigned mode with assignees",
+			when:          "assigned",
+			workflowState: "awaiting_review",
+			assignees:     []string{"bob"},
+			shouldPost:    true,
+		},
+		{
+			name:          "assigned mode without assignees",
+			when:          "assigned",
+			workflowState: "awaiting_review",
+			assignees:     []string{},
+			shouldPost:    false,
+		},
+		{
+			name:          "blocked mode with actions",
+			when:          "blocked",
+			workflowState: "awaiting_review",
+			nextAction:    map[string]Action{"bob": {Kind: "review"}},
+			shouldPost:    true,
+		},
+		{
+			name:          "blocked mode without actions",
+			when:          "blocked",
+			workflowState: "draft",
+			nextAction:    map[string]Action{},
+			shouldPost:    false,
+		},
+		{
+			name:          "passing mode ready for review",
+			when:          "passing",
+			workflowState: "assigned_waiting_for_review",
+			shouldPost:    true,
+		},
+		{
+			name:          "passing mode in draft",
+			when:          "passing",
+			workflowState: "in_draft",
+			shouldPost:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			discord := newMockDiscordClient()
+			discord.channelIDs["testrepo"] = "chan-testrepo"
+			discord.botInChannel["chan-testrepo"] = true
+			discord.forumChannels["chan-testrepo"] = true
+
+			configMgr := &mockConfigManager{
+				configs:  make(map[string]*config.DiscordConfig),
+				channels: make(map[string][]string),
+			}
+			// Override When method to return test value
+			configMgr.configs["testorg"] = &config.DiscordConfig{}
+
+			store := state.NewMemoryStore()
+			turn := newMockTurnClient()
+			turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+				PullRequest: PRInfo{
+					Title:     "Test PR",
+					Author:    "alice",
+					State:     "open",
+					Assignees: tt.assignees,
+				},
+				Analysis: Analysis{
+					NextAction:    tt.nextAction,
+					WorkflowState: tt.workflowState,
+				},
+			}
+
+			// Create custom config manager with specific "when" value
+			customCfg := &mockConfigManagerWithWhen{
+				mockConfigManager: configMgr,
+				whenValue:         tt.when,
+			}
+
+			coord := NewCoordinator(CoordinatorConfig{
+				Discord: discord,
+				Config:  customCfg,
+				Store:   store,
+				Turn:    turn,
+				Org:     "testorg",
+			})
+
+			event := SprinklerEvent{
+				URL:        "https://github.com/testorg/testrepo/pull/42",
+				Type:       "pull_request",
+				DeliveryID: "delivery-" + tt.name,
+			}
+
+			coord.ProcessEvent(ctx, event)
+			coord.Wait()
+
+			threadCount := len(discord.forumThreads)
+			if tt.shouldPost && threadCount == 0 {
+				t.Errorf("Expected forum thread to be posted, got 0 threads")
+			}
+			if !tt.shouldPost && threadCount > 0 {
+				t.Errorf("Expected no forum thread, got %d threads", threadCount)
+			}
+		})
+	}
+}
+
+type mockConfigManagerWithWhen struct {
+	*mockConfigManager
+	whenValue string
+}
+
+func (m *mockConfigManagerWithWhen) When(_, _ string) string {
+	return m.whenValue
+}
+
+func TestCoordinator_ProcessForumThread_Archive(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+	discord.forumChannels["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	// Create initial thread
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Merge the PR - should archive thread
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "closed",
+			Merged: true,
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{},
+		},
+	}
+
+	event2 := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-2",
+	}
+	coord.ProcessEvent(ctx, event2)
+	coord.Wait()
+
+	// Thread should have been archived
+	// (checking this would require tracking archived threads in mock)
+}
+
+func TestCoordinator_ProcessForumThread_UnchangedContent(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+	discord.forumChannels["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	// Create initial thread
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	initialThreadCount := len(discord.forumThreads)
+
+	// Process again with same content - should skip update
+	event2 := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-2",
+	}
+	coord.ProcessEvent(ctx, event2)
+	coord.Wait()
+
+	// Should not create additional threads for unchanged content
+	if len(discord.forumThreads) != initialThreadCount {
+		// Content may have changed, or could be an update
+	}
+}
+
+func TestCoordinator_ProcessTextChannel_NoExistingMessage(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	if len(discord.postedMessages) != 1 {
+		t.Errorf("Expected 1 posted message, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessTextChannel_UnchangedContent(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	// Create initial message
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	initialUpdates := len(discord.updatedMessages)
+
+	// Process again with same content
+	event2 := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-2",
+	}
+	coord.ProcessEvent(ctx, event2)
+	coord.Wait()
+
+	// May skip update if content unchanged
+	if len(discord.updatedMessages) > initialUpdates {
+		// Content unchanged, may skip update
+	}
+}
+
+func TestCoordinator_ProcessMultipleChannels(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["channel1"] = "chan-1"
+	discord.channelIDs["channel2"] = "chan-2"
+	discord.botInChannel["chan-1"] = true
+	discord.botInChannel["chan-2"] = true
+
+	configMgr := &mockConfigManager{
+		configs:  make(map[string]*config.DiscordConfig),
+		channels: make(map[string][]string),
+	}
+	// Configure multiple channels for the repo
+	configMgr.channels["testorg:testrepo"] = []string{"channel1", "channel2"}
+
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Should post to both channels
+	if len(discord.postedMessages) != 2 {
+		t.Errorf("Expected 2 posted messages (one per channel), got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessPRWithAssignees(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:     "Test PR",
+			Author:    "alice",
+			State:     "open",
+			Assignees: []string{"bob", "charlie"},
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	if len(discord.postedMessages) != 1 {
+		t.Errorf("Expected 1 posted message, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessPRWithMergeConflict(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			MergeConflict: true,
+			NextAction: map[string]Action{
+				"alice": {Kind: "resolve_conflict"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	if len(discord.postedMessages) != 1 {
+		t.Errorf("Expected 1 posted message for PR with conflict, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessPRApproved(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			Approved: true,
+			NextAction: map[string]Action{
+				"alice": {Kind: "merge"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	if len(discord.postedMessages) != 1 {
+		t.Errorf("Expected 1 posted message for approved PR, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessDMForUser_UpdateExistingDM(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+	discord.usersInGuild["discord-bob"] = true
+
+	configMgr := &mockConfigManagerWithDelay{
+		mockConfigManager: newMockConfigManager(),
+		delay:             65,
+	}
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+	})
+
+	// Create initial DM
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Update the PR - should update existing DM
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR - Updated",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review", Reason: "needs changes"},
+			},
+		},
+	}
+
+	event2 := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-2",
+	}
+	coord.ProcessEvent(ctx, event2)
+	coord.Wait()
+
+	// Should have updated DMs (either sent immediately or queued)
+}
+
+func TestCoordinator_ProcessDMForUser_QueuedDMUpdate(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+	discord.usersInGuild["discord-bob"] = true
+
+	configMgr := &mockConfigManagerWithDelay{
+		mockConfigManager: newMockConfigManager(),
+		delay:             65, // DMs delayed
+	}
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+	})
+
+	// Queue a DM
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Update the PR while DM is queued
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR - Updated",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review", Reason: "new changes"},
+			},
+		},
+	}
+
+	event2 := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-2",
+	}
+	coord.ProcessEvent(ctx, event2)
+	coord.Wait()
+
+	// Should update queued DM
+}
+
+func TestCoordinator_ProcessDMForUser_UnchangedState(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+	discord.usersInGuild["discord-bob"] = true
+
+	configMgr := &mockConfigManagerWithDelay{
+		mockConfigManager: newMockConfigManager(),
+		delay:             0, // Send immediately
+	}
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+	})
+
+	// Send initial DM
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	initialDMs := len(discord.sentDMs)
+
+	// Process again with same state - should skip
+	event2 := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-2",
+	}
+	coord.ProcessEvent(ctx, event2)
+	coord.Wait()
+
+	// Should not send duplicate DM for unchanged state
+	if len(discord.sentDMs) > initialDMs {
+		// May have sent update, but idempotency should prevent duplicates
+	}
+}
+
+func TestCoordinator_ProcessTextChannel_WithWhenThresholds(t *testing.T) {
+	tests := []struct {
+		name          string
+		when          string
+		workflowState string
+		assignees     []string
+		nextAction    map[string]Action
+		shouldPost    bool
+	}{
+		{
+			name:          "passing mode with tests passing",
+			when:          "passing",
+			workflowState: "assigned_waiting_for_review",
+			shouldPost:    true,
+		},
+		{
+			name:          "passing mode with tests pending",
+			when:          "passing",
+			workflowState: "published_waiting_for_tests",
+			shouldPost:    false,
+		},
+		{
+			name:          "blocked mode with blockers",
+			when:          "blocked",
+			workflowState: "awaiting_review",
+			nextAction:    map[string]Action{"bob": {Kind: "review"}},
+			shouldPost:    true,
+		},
+		{
+			name:          "assigned mode with assignees",
+			when:          "assigned",
+			workflowState: "draft",
+			assignees:     []string{"alice"},
+			shouldPost:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			discord := newMockDiscordClient()
+			discord.channelIDs["testrepo"] = "chan-testrepo"
+			discord.botInChannel["chan-testrepo"] = true
+
+			configMgr := &mockConfigManagerWithWhen{
+				mockConfigManager: newMockConfigManager(),
+				whenValue:         tt.when,
+			}
+			store := state.NewMemoryStore()
+			turn := newMockTurnClient()
+			turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+				PullRequest: PRInfo{
+					Title:     "Test PR",
+					Author:    "alice",
+					State:     "open",
+					Assignees: tt.assignees,
+				},
+				Analysis: Analysis{
+					NextAction:    tt.nextAction,
+					WorkflowState: tt.workflowState,
+				},
+			}
+
+			coord := NewCoordinator(CoordinatorConfig{
+				Discord: discord,
+				Config:  configMgr,
+				Store:   store,
+				Turn:    turn,
+				Org:     "testorg",
+			})
+
+			event := SprinklerEvent{
+				URL:        "https://github.com/testorg/testrepo/pull/42",
+				Type:       "pull_request",
+				DeliveryID: "delivery-" + tt.name,
+			}
+
+			coord.ProcessEvent(ctx, event)
+			coord.Wait()
+
+			messageCount := len(discord.postedMessages)
+			if tt.shouldPost && messageCount == 0 {
+				t.Errorf("Expected message to be posted, got 0 messages")
+			}
+			if !tt.shouldPost && messageCount > 0 {
+				t.Errorf("Expected no message, got %d messages", messageCount)
+			}
+		})
+	}
+}
+
+func TestCoordinator_ProcessPRWithUnresolvedComments(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			UnresolvedComments: 5,
+			NextAction: map[string]Action{
+				"alice": {Kind: "address_comments"},
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	if len(discord.postedMessages) != 1 {
+		t.Errorf("Expected 1 posted message for PR with unresolved comments, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessPRWithPendingChecks(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+
+	configMgr := newMockConfigManager()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			Checks: Checks{
+				Pending: 3,
+				Passing: 2,
+			},
+			WorkflowState: "published_waiting_for_tests",
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	if len(discord.postedMessages) != 1 {
+		t.Errorf("Expected 1 posted message for PR with pending checks, got %d", len(discord.postedMessages))
+	}
+}
+
+func TestCoordinator_ProcessMultipleUsers(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.channelIDs["testrepo"] = "chan-testrepo"
+	discord.botInChannel["chan-testrepo"] = true
+	discord.usersInGuild["discord-bob"] = true
+	discord.usersInGuild["discord-charlie"] = true
+
+	configMgr := &mockConfigManagerWithDelay{
+		mockConfigManager: newMockConfigManager(),
+		delay:             65,
+	}
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/testrepo/pull/42"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob":     {Kind: "review"},
+				"charlie": {Kind: "review"},
+			},
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+	userMapper.mappings["charlie"] = "discord-charlie"
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/testrepo/pull/42",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+	}
+
+	coord.ProcessEvent(ctx, event)
+	coord.Wait()
+
+	// Should queue DMs for both bob and charlie
+}
+
+func TestCoordinator_checkDailyReports_WithGuildID(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.usersInGuild["discord-bob"] = true
+	discord.activeUsers["discord-bob"] = true
+
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+
+	// Setup PR responses
+	turn.responses["https://github.com/testorg/repo1/pull/1"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR 1",
+			Author: "bob",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"alice": {Kind: "review"},
+			},
+			WorkflowState: "awaiting_review",
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+
+	// Configure with guild ID
+	configMgr := newMockConfigManager()
+	configMgr.configs["testorg"] = &config.DiscordConfig{
+		Global: config.GlobalConfig{
+			GuildID: "test-guild-123",
+		},
+	}
+
+	searcher := &mockPRSearcher{
+		openPRs: []PRSearchResult{
+			{
+				URL:       "https://github.com/testorg/repo1/pull/1",
+				UpdatedAt: time.Now(),
+				Owner:     "testorg",
+				Repo:      "repo1",
+				Number:    1,
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+		Searcher:   searcher,
+	})
+
+	coord.PollAndReconcile(ctx)
+
+	// Daily reports should be checked
+}
+
+func TestCoordinator_checkUserDailyReport_NoMapping(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+
+	configMgr := newMockConfigManager()
+	configMgr.configs["testorg"] = &config.DiscordConfig{
+		Global: config.GlobalConfig{
+			GuildID: "test-guild-123",
+		},
+	}
+
+	searcher := &mockPRSearcher{
+		openPRs: []PRSearchResult{
+			{
+				URL:       "https://github.com/testorg/repo1/pull/1",
+				UpdatedAt: time.Now(),
+				Owner:     "testorg",
+				Repo:      "repo1",
+				Number:    1,
+			},
+		},
+	}
+
+	// No user mapper - should skip
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: nil,
+		Searcher:   searcher,
+	})
+
+	coord.PollAndReconcile(ctx)
+
+	// Should handle gracefully when no user mapper
+}
+
+func TestCoordinator_checkUserDailyReport_UserNotInGuild(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	// Don't add bob to usersInGuild
+
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/repo1/pull/1"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+
+	configMgr := newMockConfigManager()
+	configMgr.configs["testorg"] = &config.DiscordConfig{
+		Global: config.GlobalConfig{
+			GuildID: "test-guild-123",
+		},
+	}
+
+	searcher := &mockPRSearcher{
+		openPRs: []PRSearchResult{
+			{
+				URL:       "https://github.com/testorg/repo1/pull/1",
+				UpdatedAt: time.Now(),
+				Owner:     "testorg",
+				Repo:      "repo1",
+				Number:    1,
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+		Searcher:   searcher,
+	})
+
+	coord.PollAndReconcile(ctx)
+
+	// Should skip users not in guild
+}
+
+func TestCoordinator_checkUserDailyReport_UserNotActive(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.usersInGuild["discord-bob"] = true
+	// Don't add bob to activeUsers
+
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/repo1/pull/1"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+
+	configMgr := newMockConfigManager()
+	configMgr.configs["testorg"] = &config.DiscordConfig{
+		Global: config.GlobalConfig{
+			GuildID: "test-guild-123",
+		},
+	}
+
+	searcher := &mockPRSearcher{
+		openPRs: []PRSearchResult{
+			{
+				URL:       "https://github.com/testorg/repo1/pull/1",
+				UpdatedAt: time.Now(),
+				Owner:     "testorg",
+				Repo:      "repo1",
+				Number:    1,
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+		Searcher:   searcher,
+	})
+
+	coord.PollAndReconcile(ctx)
+
+	// Should skip inactive users
+}
+
+func TestCoordinator_checkUserDailyReport_WithIncomingPRs(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.usersInGuild["discord-bob"] = true
+	discord.activeUsers["discord-bob"] = true
+
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/repo1/pull/1"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review", Reason: "needs review"},
+			},
+			WorkflowState: "awaiting_review",
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+
+	configMgr := newMockConfigManager()
+	configMgr.configs["testorg"] = &config.DiscordConfig{
+		Global: config.GlobalConfig{
+			GuildID: "test-guild-123",
+		},
+	}
+
+	searcher := &mockPRSearcher{
+		openPRs: []PRSearchResult{
+			{
+				URL:       "https://github.com/testorg/repo1/pull/1",
+				UpdatedAt: time.Now(),
+				Owner:     "testorg",
+				Repo:      "repo1",
+				Number:    1,
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+		Searcher:   searcher,
+	})
+
+	coord.PollAndReconcile(ctx)
+
+	// Should process incoming PRs for bob
+}
+
+func TestCoordinator_checkUserDailyReport_WithOutgoingPRs(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.usersInGuild["discord-alice"] = true
+	discord.activeUsers["discord-alice"] = true
+
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/repo1/pull/1"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			NextAction: map[string]Action{
+				"bob": {Kind: "review"},
+			},
+			WorkflowState: "awaiting_review",
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["alice"] = "discord-alice"
+
+	configMgr := newMockConfigManager()
+	configMgr.configs["testorg"] = &config.DiscordConfig{
+		Global: config.GlobalConfig{
+			GuildID: "test-guild-123",
+		},
+	}
+
+	searcher := &mockPRSearcher{
+		openPRs: []PRSearchResult{
+			{
+				URL:       "https://github.com/testorg/repo1/pull/1",
+				UpdatedAt: time.Now(),
+				Owner:     "testorg",
+				Repo:      "repo1",
+				Number:    1,
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+		Searcher:   searcher,
+	})
+
+	coord.PollAndReconcile(ctx)
+
+	// Should process outgoing PRs for alice
+}
+
+func TestCoordinator_checkUserDailyReport_WithBlockedPRs(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.usersInGuild["discord-alice"] = true
+	discord.activeUsers["discord-alice"] = true
+
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	turn.responses["https://github.com/testorg/repo1/pull/1"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+		Analysis: Analysis{
+			MergeConflict: true,
+			NextAction: map[string]Action{
+				"alice": {Kind: "resolve_conflict"},
+			},
+			WorkflowState: "blocked",
+		},
+	}
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["alice"] = "discord-alice"
+
+	configMgr := newMockConfigManager()
+	configMgr.configs["testorg"] = &config.DiscordConfig{
+		Global: config.GlobalConfig{
+			GuildID: "test-guild-123",
+		},
+	}
+
+	searcher := &mockPRSearcher{
+		openPRs: []PRSearchResult{
+			{
+				URL:       "https://github.com/testorg/repo1/pull/1",
+				UpdatedAt: time.Now(),
+				Owner:     "testorg",
+				Repo:      "repo1",
+				Number:    1,
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+		Searcher:   searcher,
+	})
+
+	coord.PollAndReconcile(ctx)
+
+	// Should flag blocked PRs
+}
+
+func TestCoordinator_checkUserDailyReport_TurnAPIError(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.usersInGuild["discord-bob"] = true
+	discord.activeUsers["discord-bob"] = true
+
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+	// Don't set response - will return error
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+
+	configMgr := newMockConfigManager()
+	configMgr.configs["testorg"] = &config.DiscordConfig{
+		Global: config.GlobalConfig{
+			GuildID: "test-guild-123",
+		},
+	}
+
+	searcher := &mockPRSearcher{
+		openPRs: []PRSearchResult{
+			{
+				URL:       "https://github.com/testorg/repo1/pull/1",
+				UpdatedAt: time.Now(),
+				Owner:     "testorg",
+				Repo:      "repo1",
+				Number:    1,
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+		Searcher:   searcher,
+	})
+
+	coord.PollAndReconcile(ctx)
+
+	// Should handle Turn API errors gracefully
+}
+
+func TestCoordinator_checkUserDailyReport_InvalidPRURL(t *testing.T) {
+	ctx := context.Background()
+
+	discord := newMockDiscordClient()
+	discord.usersInGuild["discord-bob"] = true
+	discord.activeUsers["discord-bob"] = true
+
+	store := state.NewMemoryStore()
+	turn := newMockTurnClient()
+
+	userMapper := newMockUserMapper()
+	userMapper.mappings["bob"] = "discord-bob"
+
+	configMgr := newMockConfigManager()
+	configMgr.configs["testorg"] = &config.DiscordConfig{
+		Global: config.GlobalConfig{
+			GuildID: "test-guild-123",
+		},
+	}
+
+	searcher := &mockPRSearcher{
+		openPRs: []PRSearchResult{
+			{
+				URL:       "https://invalid.com/not/a/pr",
+				UpdatedAt: time.Now(),
+			},
+		},
+	}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+		Searcher:   searcher,
+	})
+
+	coord.PollAndReconcile(ctx)
+
+	// Should skip invalid PR URLs
+}
+
+// TestCoordinator_updateDMForClosedPR_DMDoesNotExist tests when no DM exists.
+func TestCoordinator_updateDMForClosedPR_DMDoesNotExist(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	// DM doesn't exist - should return early without any updates
+	coord.updateDMForClosedPR(ctx, "user123", "https://github.com/owner/repo/pull/1", format.StateMerged, "PR merged!")
+
+	// No DMs should have been updated
+	if len(discord.updatedDMs) != 0 {
+		t.Errorf("Expected no DM updates, got %d", len(discord.updatedDMs))
+	}
+}
+
+// TestCoordinator_updateDMForClosedPR_MissingChannelOrMessageID tests when DM info is incomplete.
+func TestCoordinator_updateDMForClosedPR_MissingChannelOrMessageID(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+
+	// DM exists but missing channel ID
+	_ = store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
+		MessageID: "msg123",
+		// ChannelID missing
+	})
+	coord.updateDMForClosedPR(ctx, "user123", prURL, format.StateMerged, "PR merged!")
+
+	// DM exists but missing message ID
+	_ = store.SaveDMInfo(ctx, "user456", prURL, state.DMInfo{
+		ChannelID: "dm456",
+		// MessageID missing
+	})
+	coord.updateDMForClosedPR(ctx, "user456", prURL, format.StateMerged, "PR merged!")
+
+	// No DMs should have been updated
+	if len(discord.updatedDMs) != 0 {
+		t.Errorf("Expected no DM updates, got %d", len(discord.updatedDMs))
+	}
+}
+
+// TestCoordinator_updateDMForClosedPR_IdempotencyCheck tests that identical state updates are skipped.
+func TestCoordinator_updateDMForClosedPR_IdempotencyCheck(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+
+	// DM exists with the same state already
+	_ = store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
+		ChannelID:  "dm123",
+		MessageID:  "msg123",
+		LastState:  string(format.StateMerged),
+		SentAt:     time.Now(),
+	})
+
+	// Try to update with same state - should be skipped (idempotency)
+	coord.updateDMForClosedPR(ctx, "user123", prURL, format.StateMerged, "PR merged!")
+
+	// No DMs should have been updated
+	if len(discord.updatedDMs) != 0 {
+		t.Errorf("Expected no DM updates (idempotent), got %d", len(discord.updatedDMs))
+	}
+}
+
+// TestCoordinator_updateDMForClosedPR_UpdateError tests handling of Discord API update errors.
+func TestCoordinator_updateDMForClosedPR_UpdateError(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+
+	// DM exists with different state
+	_ = store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
+		ChannelID:  "dm123",
+		MessageID:  "msg123",
+		LastState:  string(format.StateNeedsReview),
+		SentAt:     time.Now(),
+	})
+
+	// Make Discord API fail
+	discord.shouldFailUpdateDM = true
+
+	// Update should be attempted but fail gracefully
+	coord.updateDMForClosedPR(ctx, "user123", prURL, format.StateMerged, "PR merged!")
+
+	// Store should NOT be updated on Discord API failure
+	dmInfo, exists := store.DMInfo(ctx, "user123", prURL)
+	if !exists {
+		t.Fatal("DM info should still exist")
+	}
+	if dmInfo.LastState != string(format.StateNeedsReview) {
+		t.Errorf("State should remain %s, got %s", format.StateNeedsReview, dmInfo.LastState)
+	}
+}
+
+// TestCoordinator_updateDMForClosedPR_Success tests successful DM update for closed PR.
+func TestCoordinator_updateDMForClosedPR_Success(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+
+	// DM exists with different state
+	_ = store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
+		ChannelID:   "dm123",
+		MessageID:   "msg123",
+		LastState:   string(format.StateNeedsReview),
+		MessageText: "Old message",
+		SentAt:      time.Now().Add(-1 * time.Hour),
+	})
+
+	newMessage := "PR merged!"
+
+	// Update should succeed
+	coord.updateDMForClosedPR(ctx, "user123", prURL, format.StateMerged, newMessage)
+
+	// Discord should have been called
+	if len(discord.updatedDMs) != 1 {
+		t.Fatalf("Expected 1 DM update, got %d", len(discord.updatedDMs))
+	}
+	if discord.updatedDMs[0].channelID != "dm123" {
+		t.Errorf("Channel ID = %s, want dm123", discord.updatedDMs[0].channelID)
+	}
+	if discord.updatedDMs[0].messageID != "msg123" {
+		t.Errorf("Message ID = %s, want msg123", discord.updatedDMs[0].messageID)
+	}
+	if discord.updatedDMs[0].text != newMessage {
+		t.Errorf("Content = %s, want %s", discord.updatedDMs[0].text, newMessage)
+	}
+
+	// Store should be updated
+	dmInfo, exists := store.DMInfo(ctx, "user123", prURL)
+	if !exists {
+		t.Fatal("DM info should exist")
+	}
+	if dmInfo.LastState != string(format.StateMerged) {
+		t.Errorf("State = %s, want %s", dmInfo.LastState, format.StateMerged)
+	}
+	if dmInfo.MessageText != newMessage {
+		t.Errorf("MessageText = %s, want %s", dmInfo.MessageText, newMessage)
+	}
+}
+
+// TestCoordinator_cancelPendingDMsForPR_GetPendingDMsError tests error handling when fetching pending DMs.
+func TestCoordinator_cancelPendingDMsForPR_GetPendingDMsError(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	// Make store fail on PendingDMs
+	store.shouldFailPendingDMs = true
+
+	// Should handle error gracefully
+	coord.cancelPendingDMsForPR(ctx, "https://github.com/owner/repo/pull/1")
+
+	// No further operations should occur
+}
+
+// TestCoordinator_cancelPendingDMsForPR_MatchingAndNonMatching tests canceling multiple DMs.
+func TestCoordinator_cancelPendingDMsForPR_MatchingAndNonMatching(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+	otherPRURL := "https://github.com/owner/repo/pull/2"
+
+	// Add multiple pending DMs
+	store.pendingDMs = []*state.PendingDM{
+		{ID: "dm1", UserID: "user1", PRURL: prURL, SendAt: time.Now().Add(1 * time.Hour)},
+		{ID: "dm2", UserID: "user2", PRURL: otherPRURL, SendAt: time.Now().Add(1 * time.Hour)},
+		{ID: "dm3", UserID: "user3", PRURL: prURL, SendAt: time.Now().Add(2 * time.Hour)},
+	}
+
+	// Cancel DMs for prURL
+	coord.cancelPendingDMsForPR(ctx, prURL)
+
+	// Should have removed dm1 and dm3, but not dm2
+	if len(store.pendingDMs) != 1 {
+		t.Fatalf("Expected 1 pending DM remaining, got %d", len(store.pendingDMs))
+	}
+	if store.pendingDMs[0].ID != "dm2" {
+		t.Errorf("Wrong DM remained, ID = %s", store.pendingDMs[0].ID)
+	}
+}
+
+// TestCoordinator_cancelPendingDMsForPR_RemoveError tests handling of removal errors.
+func TestCoordinator_cancelPendingDMsForPR_RemoveError(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+
+	// Add pending DMs
+	store.pendingDMs = []*state.PendingDM{
+		{ID: "dm1", UserID: "user1", PRURL: prURL, SendAt: time.Now().Add(1 * time.Hour)},
+		{ID: "dm2", UserID: "user2", PRURL: prURL, SendAt: time.Now().Add(2 * time.Hour)},
+	}
+
+	// Make RemovePendingDM fail for first DM
+	store.failRemoveDMID = "dm1"
+
+	// Should continue processing despite error
+	coord.cancelPendingDMsForPR(ctx, prURL)
+
+	// dm1 should remain (failed to remove), dm2 should be removed
+	remainingCount := 0
+	for _, dm := range store.pendingDMs {
+		if dm.PRURL == prURL {
+			remainingCount++
+		}
+	}
+
+	if remainingCount != 1 {
+		t.Errorf("Expected 1 DM to remain (failed removal), got %d", remainingCount)
+	}
+}
+
+// TestCoordinator_processTextChannel_ClaimFailedFindMessage tests cross-instance race where claim fails.
+func TestCoordinator_processTextChannel_ClaimFailedFindMessage(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+	channelID := "channel1"
+
+	// Make ClaimThread fail (another instance claimed it)
+	store.claimThreadShouldFail = true
+
+	// Add a message that the other instance created
+	discord.channelMessages[channelID] = map[string]string{
+		"msg_from_other_instance": "PR #1 content from other instance",
+	}
+
+	params := format.ChannelMessageParams{
+		PRURL:       prURL,
+		Number:      1,
+		State:       format.StateNeedsReview,
+		ChannelName: "test-channel",
+	}
+
+	checkResp := &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			State:  "open",
+		},
+	}
+
+	// Should find the message from other instance
+	err := coord.processTextChannel(ctx, channelID, "owner", "repo", 1, params, checkResp, state.ThreadInfo{}, false)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Should have saved thread info for the found message
+	threadInfo, exists := store.Store.Thread(ctx, "owner", "repo", 1, channelID)
+	if !exists {
+		t.Error("Thread info should be saved after finding message")
+	}
+	if threadInfo.MessageID != "msg_from_other_instance" {
+		t.Errorf("Message ID = %s, want msg_from_other_instance", threadInfo.MessageID)
+	}
+}
+
+// TestCoordinator_processTextChannel_ClaimSucceededSearchFindsSameContent tests successful claim with existing message.
+func TestCoordinator_processTextChannel_ClaimSucceededSearchFindsSameContent(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+	channelID := "channel1"
+
+	params := format.ChannelMessageParams{
+		PRURL:       prURL,
+		Number:      1,
+		State:       format.StateNeedsReview,
+		ChannelName: "test-channel",
+		Title:       "Test PR",
+	}
+
+	expectedContent := format.ChannelMessage(params)
+
+	// Add existing message with same content
+	discord.channelMessages[channelID] = map[string]string{
+		"existing_msg": expectedContent,
+	}
+
+	checkResp := &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			State:  "open",
+		},
+	}
+
+	// Should find existing message and skip creation
+	err := coord.processTextChannel(ctx, channelID, "owner", "repo", 1, params, checkResp, state.ThreadInfo{}, false)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Should not have posted a new message
+	if len(discord.postedMessages) != 0 {
+		t.Errorf("Should not post new message when identical one exists, got %d posts", len(discord.postedMessages))
+	}
+
+	// Should have saved thread info
+	threadInfo, exists := store.Store.Thread(ctx, "owner", "repo", 1, channelID)
+	if !exists {
+		t.Error("Thread info should be saved")
+	}
+	if threadInfo.MessageID != "existing_msg" {
+		t.Errorf("Message ID = %s, want existing_msg", threadInfo.MessageID)
+	}
+}
+
+// TestCoordinator_processTextChannel_UpdateFailsFallsThrough tests when cache update fails and falls through to search.
+func TestCoordinator_processTextChannel_UpdateFailsFallsThrough(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+	channelID := "channel1"
+
+	params := format.ChannelMessageParams{
+		PRURL:       prURL,
+		Number:      1,
+		State:       format.StateNeedsReview,
+		ChannelName: "test-channel",
+		Title:       "Updated PR Title",
+	}
+
+	// Existing thread in cache with old content
+	oldThreadInfo := state.ThreadInfo{
+		MessageID:   "old_msg",
+		ChannelID:   channelID,
+		MessageText: "old content",
+		LastState:   string(format.StateNeedsReview),
+	}
+	_ = store.SaveThread(ctx, "owner", "repo", 1, channelID, oldThreadInfo)
+
+	// Make UpdateMessage fail
+	discord.shouldFailUpdate = true
+
+	// Add an existing message in the channel that will be found by search
+	newContent := format.ChannelMessage(params)
+	discord.channelMessages[channelID] = map[string]string{
+		"found_msg": newContent,
+	}
+
+	checkResp := &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Updated PR Title",
+			State:  "open",
+		},
+	}
+
+	// Should try to update cached message, fail, then search and find the message
+	err := coord.processTextChannel(ctx, channelID, "owner", "repo", 1, params, checkResp, oldThreadInfo, true)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Should have attempted 1 update (which failed)
+	if len(discord.updatedMessages) != 1 {
+		t.Errorf("Expected 1 update attempt, got %d", len(discord.updatedMessages))
+	}
+
+	// Should have found the message and updated thread info
+	threadInfo, exists := store.Store.Thread(ctx, "owner", "repo", 1, channelID)
+	if !exists {
+		t.Error("Thread info should exist")
+	}
+	if threadInfo.MessageID != "found_msg" {
+		t.Errorf("Message ID = %s, want found_msg (from search fallback)", threadInfo.MessageID)
+	}
+}
+

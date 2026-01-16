@@ -626,3 +626,126 @@ func TestManager_fetchConfig_EmptyContent(t *testing.T) {
 		t.Error("fetchConfig() should error on empty content")
 	}
 }
+
+// TestDiscordConfig_GetUsers tests the GetUsers method.
+func TestDiscordConfig_GetUsers(t *testing.T) {
+	cfg := &DiscordConfig{
+		Users: map[string]string{
+			"alice": "111111111111111111",
+			"bob":   "222222222222222222",
+		},
+	}
+
+	users := cfg.GetUsers()
+	if len(users) != 2 {
+		t.Errorf("GetUsers() returned %d users, want 2", len(users))
+	}
+	if users["alice"] != "111111111111111111" {
+		t.Errorf("users[alice] = %q, want 111111111111111111", users["alice"])
+	}
+	if users["bob"] != "222222222222222222" {
+		t.Errorf("users[bob] = %q, want 222222222222222222", users["bob"])
+	}
+}
+
+// TestManager_When tests the When method for thread posting thresholds.
+func TestManager_When(t *testing.T) {
+	m := New()
+
+	tests := []struct {
+		name    string
+		config  *DiscordConfig
+		org     string
+		channel string
+		want    string
+	}{
+		{
+			name: "no config returns default",
+			org:  "nonexistent",
+			channel: "any",
+			want: "immediate",
+		},
+		{
+			name: "global when setting",
+			config: &DiscordConfig{
+				Global: GlobalConfig{
+					When: "passing",
+				},
+			},
+			org:     "testorg",
+			channel: "any",
+			want:    "passing",
+		},
+		{
+			name: "channel override",
+			config: &DiscordConfig{
+				Global: GlobalConfig{
+					When: "passing",
+				},
+				Channels: map[string]ChannelConfig{
+					"critical": {
+						When: stringPtr("immediate"),
+					},
+				},
+			},
+			org:     "testorg",
+			channel: "critical",
+			want:    "immediate",
+		},
+		{
+			name: "channel without override uses global",
+			config: &DiscordConfig{
+				Global: GlobalConfig{
+					When: "blocked",
+				},
+				Channels: map[string]ChannelConfig{
+					"other": {
+						Repos: []string{"repo1"},
+					},
+				},
+			},
+			org:     "testorg",
+			channel: "other",
+			want:    "blocked",
+		},
+		{
+			name: "no global setting returns default",
+			config: &DiscordConfig{
+				Channels: map[string]ChannelConfig{
+					"chan1": {
+						Repos: []string{"repo1"},
+					},
+				},
+			},
+			org:     "testorg",
+			channel: "chan1",
+			want:    "immediate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.config != nil {
+				m.mu.Lock()
+				m.configs[tt.org] = tt.config
+				m.mu.Unlock()
+			}
+
+			got := m.When(tt.org, tt.channel)
+			if got != tt.want {
+				t.Errorf("When(%q, %q) = %q, want %q", tt.org, tt.channel, got, tt.want)
+			}
+
+			// Cleanup
+			if tt.config != nil {
+				m.mu.Lock()
+				delete(m.configs, tt.org)
+				m.mu.Unlock()
+			}
+		})
+	}
+}
+
+func stringPtr(s string) *string {
+	return &s
+}

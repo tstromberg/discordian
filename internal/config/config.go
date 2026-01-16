@@ -19,7 +19,7 @@ import (
 
 const (
 	defaultReminderDMDelayMinutes = 65
-	defaultConfigCacheTTL         = 10 * time.Minute
+	defaultConfigCacheTTL         = 20 * time.Minute
 	maxRetryAttempts              = 5
 	retryDelay                    = time.Second
 	maxRetryDelay                 = 2 * time.Minute
@@ -188,7 +188,23 @@ func (m *Manager) LoadConfig(ctx context.Context, org string) error {
 
 	cfg, err := m.fetchConfig(ctx, client, org)
 	if err != nil {
-		slog.Warn("using default config", "org", org, "reason", err)
+		// Check if we have a previous config to fall back to
+		m.mu.Lock()
+		previousCfg, hasPrevious := m.configs[org]
+		m.mu.Unlock()
+
+		if hasPrevious {
+			slog.Warn("failed to fetch config, keeping previous config",
+				"org", org,
+				"reason", err,
+				"channels", len(previousCfg.Channels),
+				"users", len(previousCfg.Users))
+			return nil
+		}
+
+		slog.Warn("no previous config available, using default config",
+			"org", org,
+			"reason", err)
 		cfg = createDefaultConfig()
 	}
 

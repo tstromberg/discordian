@@ -175,7 +175,9 @@ func TestTurnHTTPClient_Check_ServerError(t *testing.T) {
 	defer server.Close()
 
 	client := NewTurnClient(server.URL, &mockTokenProvider{token: "testtoken"})
-	ctx := context.Background()
+	// Use short timeout to avoid slow retries in tests
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
 
 	_, err := client.Check(ctx, "https://github.com/owner/repo/pull/123", "user", time.Now())
 	if err == nil {
@@ -190,7 +192,9 @@ func TestTurnHTTPClient_Check_InvalidJSON(t *testing.T) {
 	defer server.Close()
 
 	client := NewTurnClient(server.URL, &mockTokenProvider{token: "testtoken"})
-	ctx := context.Background()
+	// Use short timeout to avoid slow retries in tests
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
 
 	_, err := client.Check(ctx, "https://github.com/owner/repo/pull/123", "user", time.Now())
 	if err == nil {
@@ -200,7 +204,9 @@ func TestTurnHTTPClient_Check_InvalidJSON(t *testing.T) {
 
 func TestTurnHTTPClient_Check_RequestError(t *testing.T) {
 	client := NewTurnClient("http://invalid.invalid.invalid:99999", &mockTokenProvider{token: "testtoken"})
-	ctx := context.Background()
+	// Use short timeout to avoid slow retries in tests
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
 
 	_, err := client.Check(ctx, "https://github.com/owner/repo/pull/123", "user", time.Now())
 	if err == nil {
@@ -210,7 +216,7 @@ func TestTurnHTTPClient_Check_RequestError(t *testing.T) {
 
 func TestTurnHTTPClient_Check_ContextCanceled(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(time.Second)
+		time.Sleep(10 * time.Millisecond) // Short delay for testing
 		_ = json.NewEncoder(w).Encode(CheckResponse{}) //nolint:errcheck // test handler
 	}))
 	defer server.Close()

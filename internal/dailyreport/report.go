@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/codeGROOVE-dev/discordian/internal/discord"
@@ -211,11 +212,11 @@ func randomGreeting() string {
 
 // BuildReportMessage creates a formatted message for a daily report.
 func BuildReportMessage(incoming, outgoing []discord.PRSummary) string {
-	var msg string
-	msg += fmt.Sprintf("**%s** Here is your daily report:\n\n", randomGreeting())
+	var b strings.Builder
+	fmt.Fprintf(&b, "**%s** Here is your daily report:\n\n", randomGreeting())
 
 	if len(incoming) > 0 {
-		msg += fmt.Sprintf("**Incoming PRs** (%d)\n", len(incoming))
+		fmt.Fprintf(&b, "**Incoming PRs** (%d)\n", len(incoming))
 		for i := range incoming {
 			pr := &incoming[i]
 			indicator := "🟢"
@@ -223,17 +224,17 @@ func BuildReportMessage(incoming, outgoing []discord.PRSummary) string {
 				indicator = "🔴"
 			}
 			title := format.Truncate(pr.Title, 40)
-			msg += fmt.Sprintf("%s [%s#%d](%s): %s", indicator, pr.Repo, pr.Number, pr.URL, title)
+			fmt.Fprintf(&b, "%s [%s#%d](%s): %s", indicator, pr.Repo, pr.Number, pr.URL, title)
 			if pr.Action != "" {
-				msg += fmt.Sprintf(" — *%s*", pr.Action)
+				fmt.Fprintf(&b, " — *%s*", pr.Action)
 			}
-			msg += "\n"
+			b.WriteByte('\n')
 		}
-		msg += "\n"
+		b.WriteByte('\n')
 	}
 
 	if len(outgoing) > 0 {
-		msg += fmt.Sprintf("**Your PRs** (%d)\n", len(outgoing))
+		fmt.Fprintf(&b, "**Your PRs** (%d)\n", len(outgoing))
 		for i := range outgoing {
 			pr := &outgoing[i]
 			indicator := "🟢"
@@ -241,13 +242,13 @@ func BuildReportMessage(incoming, outgoing []discord.PRSummary) string {
 				indicator = "🔴"
 			}
 			title := format.Truncate(pr.Title, 40)
-			msg += fmt.Sprintf("%s [%s#%d](%s): %s", indicator, pr.Repo, pr.Number, pr.URL, title)
+			fmt.Fprintf(&b, "%s [%s#%d](%s): %s", indicator, pr.Repo, pr.Number, pr.URL, title)
 			if pr.Action != "" {
-				msg += fmt.Sprintf(" — *%s*", pr.Action)
+				fmt.Fprintf(&b, " — *%s*", pr.Action)
 			}
-			msg += "\n"
+			b.WriteByte('\n')
 		}
 	}
 
-	return msg
+	return b.String()
 }

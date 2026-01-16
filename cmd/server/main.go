@@ -320,7 +320,7 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 	guildID := cfg.Global.GuildID
 
 	// Get or create Discord client for this guild
-	discordClient, err := cm.getOrCreateDiscordClient(ctx, guildID)
+	discordClient, err := cm.discordClientForGuild(ctx, guildID)
 	if err != nil {
 		slog.Error("failed to get Discord client",
 			"org", org,
@@ -404,6 +404,10 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 		pollTicker := time.NewTicker(5 * time.Minute)
 		defer pollTicker.Stop()
 
+		// Start cleanup ticker for lock garbage collection
+		cleanupTicker := time.NewTicker(10 * time.Minute)
+		defer cleanupTicker.Stop()
+
 		// Run initial reconciliation on startup
 		coord.PollAndReconcile(orgCtx)
 
@@ -413,13 +417,15 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 			sprinklerDone <- sprinklerClient.Start(orgCtx)
 		}()
 
-		// Main loop: handle polling and sprinkler exit
+		// Main loop: handle polling, cleanup, and sprinkler exit
 		for {
 			select {
 			case <-orgCtx.Done():
 				return
 			case <-pollTicker.C:
 				coord.PollAndReconcile(orgCtx)
+			case <-cleanupTicker.C:
+				coord.CleanupLocks()
 			case err := <-sprinklerDone:
 				cm.handleCoordinatorExit(org, err)
 				return
@@ -430,7 +436,7 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 	return true
 }
 
-func (cm *coordinatorManager) getOrCreateDiscordClient(_ context.Context, guildID string) (*discord.Client, error) {
+func (cm *coordinatorManager) discordClientForGuild(_ context.Context, guildID string) (*discord.Client, error) {
 	if client, exists := cm.discordClients[guildID]; exists {
 		return client, nil
 	}
@@ -521,8 +527,8 @@ func (cm *coordinatorManager) shutdown() error {
 	return nil
 }
 
-// GetStatus implements discord.StatusGetter interface.
-func (cm *coordinatorManager) GetStatus(guildID string) discord.BotStatus {
+// Status implements discord.StatusGetter interface.
+func (cm *coordinatorManager) Status(ctx context.Context, guildID string) discord.BotStatus {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -544,7 +550,6 @@ func (cm *coordinatorManager) GetStatus(guildID string) discord.BotStatus {
 	}
 
 	// Get pending DMs count
-	ctx := context.Background()
 	pendingDMs, err := cm.store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
 	if err == nil {
 		status.PendingDMs = len(pendingDMs)
@@ -568,8 +573,8 @@ func (cm *coordinatorManager) GetStatus(guildID string) discord.BotStatus {
 	return status
 }
 
-// GetReport implements discord.ReportGetter interface.
-func (cm *coordinatorManager) GetReport(ctx context.Context, guildID, userID string) (*discord.PRReport, error) {
+// Report implements discord.ReportGetter interface.
+func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string) (*discord.PRReport, error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -623,7 +628,7 @@ func (cm *coordinatorManager) GetReport(ctx context.Context, guildID, userID str
 	}
 
 	if githubUsername == "" {
-		return nil, fmt.Errorf("could not map Discord user to GitHub username")
+		return nil, errors.New("could not map Discord user to GitHub username")
 	}
 
 	// Get the PR searcher from the coordinator (we don't expose this currently)

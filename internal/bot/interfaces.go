@@ -38,7 +38,7 @@ type DiscordClient interface {
 	FindForumThread(ctx context.Context, forumID, prURL string) (threadID, messageID string, found bool)
 	FindChannelMessage(ctx context.Context, channelID, prURL string) (messageID string, found bool)
 	FindDMForPR(ctx context.Context, userID, prURL string) (channelID, messageID string, found bool)
-	GetMessageContent(ctx context.Context, channelID, messageID string) (string, error)
+	MessageContent(ctx context.Context, channelID, messageID string) (string, error)
 }
 
 // ConfigManager defines configuration operations.

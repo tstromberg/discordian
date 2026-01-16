@@ -21,6 +21,8 @@ github.com/codeGROOVE-dev/fido/pkg/store/null v1.10.0 h1:3F6absPj3zUaPsK7ohTTlwO
 github.com/codeGROOVE-dev/fido/pkg/store/null v1.10.0/go.mod h1:mvPXZ0lHnaQuxkSozpmWf2ZKL5bzKe/IIGFLlcQH/F4=
 github.com/codeGROOVE-dev/gsm v0.0.0-20251019065141-833fe2363d22 h1:gtN3rOc6YspO646BkcOxBhPjEqKUz+jl175jIqglfDg=
 github.com/codeGROOVE-dev/gsm v0.0.0-20251019065141-833fe2363d22/go.mod h1:KV+w19ubP32PxZPE1hOtlCpTaNpF0Bpb32w5djO8UTg=
+github.com/codeGROOVE-dev/retry v1.2.0 h1:xYpYPX2PQZmdHwuiQAGGzsBm392xIMl4nfMEFApQnu8=
+github.com/codeGROOVE-dev/retry v1.2.0/go.mod h1:8OgefgV1XP7lzX2PdKlCXILsYKuz6b4ZpHa/20iLi8E=
 github.com/golang-jwt/jwt/v5 v5.3.0 h1:pv4AsKCKKZuqlgs5sUmn4x8UlGa0kEVt/puTpKx9vvo=
 github.com/golang-jwt/jwt/v5 v5.3.0/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
 github.com/google/go-cmp v0.5.2/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=

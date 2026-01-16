@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/codeGROOVE-dev/retry"
 	"github.com/google/go-github/v50/github"
 	"gopkg.in/yaml.v3"
 )
@@ -217,42 +218,48 @@ func (m *Manager) LoadConfig(ctx context.Context, org string) error {
 
 func (*Manager) fetchConfig(ctx context.Context, client *github.Client, org string) (*DiscordConfig, error) {
 	var content *github.RepositoryContent
-	var err error
 
 	slog.Debug("fetching discord.yaml config from GitHub",
 		"org", org,
 		"repo", ".codeGROOVE",
 		"file", "discord.yaml")
 
-	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
-		content, _, _, err = client.Repositories.GetContents(ctx, org, ".codeGROOVE", "discord.yaml", nil)
-		if err == nil {
-			break
-		}
-
+	err := retry.Do(
+		func() error {
+			var fetchErr error
+			content, _, _, fetchErr = client.Repositories.GetContents(ctx, org, ".codeGROOVE", "discord.yaml", nil)
+			return fetchErr
+		},
+		retry.Context(ctx),
+		retry.Attempts(maxRetryAttempts),
+		retry.Delay(retryDelay),
+		retry.MaxDelay(maxRetryDelay),
+		retry.DelayType(retry.BackOffDelay),
+		retry.LastErrorOnly(true),
+		retry.OnRetry(func(n uint, err error) {
+			slog.Warn("GitHub API call failed, retrying",
+				"org", org,
+				"attempt", n+1,
+				"max_attempts", maxRetryAttempts,
+				"error", err)
+		}),
+		retry.RetryIf(func(err error) bool {
+			// Don't retry on 404 (config not found)
+			var ghErr *github.ErrorResponse
+			if errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusNotFound {
+				return false
+			}
+			// Don't retry on context cancellation
+			return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+		}),
+	)
+	if err != nil {
+		// Check if it's a 404 to return cleaner error
 		var ghErr *github.ErrorResponse
 		if errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusNotFound {
-			slog.Debug("config file not found in GitHub repo",
-				"org", org)
+			slog.Debug("config file not found in GitHub repo", "org", org)
 			return nil, errors.New("config not found")
 		}
-
-		slog.Warn("GitHub API call failed, retrying",
-			"org", org,
-			"attempt", attempt,
-			"max_attempts", maxRetryAttempts,
-			"error", err)
-
-		if attempt < maxRetryAttempts {
-			delay := retryDelay * time.Duration(1<<(attempt-1))
-			if delay > maxRetryDelay {
-				delay = maxRetryDelay
-			}
-			time.Sleep(delay)
-		}
-	}
-
-	if err != nil {
 		return nil, fmt.Errorf("failed to fetch config: %w", err)
 	}
 
@@ -311,21 +318,30 @@ func (m *Manager) ChannelsForRepo(org, repo string) []string {
 
 	// Auto-discover: add repo-named channel unless already included or muted
 	autoChannel := strings.ToLower(repo)
+	addAuto := true
+
+	// Check if already included
 	for _, existing := range channels {
 		if existing == autoChannel {
-			goto done // Already included
+			addAuto = false
+			break
 		}
 	}
 
 	// Check if auto-discovered channel is muted
-	for yamlChannelName, channelCfg := range cfg.Channels {
-		if strings.EqualFold(yamlChannelName, autoChannel) && channelCfg.Mute {
-			goto done
+	if addAuto {
+		for yamlChannelName, channelCfg := range cfg.Channels {
+			if strings.EqualFold(yamlChannelName, autoChannel) && channelCfg.Mute {
+				addAuto = false
+				break
+			}
 		}
 	}
-	channels = append(channels, autoChannel)
 
-done:
+	if addAuto {
+		channels = append(channels, autoChannel)
+	}
+
 	if len(channels) > 0 {
 		slog.Debug("resolved channels",
 			"org", org,

@@ -18,6 +18,10 @@ const (
 	eventTTL       = 2 * time.Hour       // Short - just for dedup
 	dailyReportTTL = 36 * time.Hour      // Slightly over 1 day to handle timezone edge cases
 	pendingDMTTL   = 4 * time.Hour       // Max time a DM can be pending
+
+	// maxEventMapSize is the maximum number of entries before inline cleanup.
+	// This prevents unbounded memory growth between scheduled cleanups.
+	maxEventMapSize = 10000
 )
 
 // pendingDMQueue stores all pending DMs in a single persisted value.
@@ -193,7 +197,13 @@ func (s *FidoStore) DMInfo(ctx context.Context, userID, prURL string) (DMInfo, b
 func (s *FidoStore) SaveDMInfo(ctx context.Context, userID, prURL string, info DMInfo) error {
 	key := fmt.Sprintf("%s:%s", userID, prURL)
 
-	// Update reverse index
+	// Persist first, then update index only on success
+	// This prevents index inconsistency if persistence fails
+	if err := s.dmInfo.Set(ctx, key, info); err != nil {
+		return err
+	}
+
+	// Update reverse index after successful persistence
 	s.dmUserIndexMu.Lock()
 	if s.dmUserIndex[prURL] == nil {
 		s.dmUserIndex[prURL] = make(map[string]bool)
@@ -201,7 +211,7 @@ func (s *FidoStore) SaveDMInfo(ctx context.Context, userID, prURL string, info D
 	s.dmUserIndex[prURL][userID] = true
 	s.dmUserIndexMu.Unlock()
 
-	return s.dmInfo.Set(ctx, key, info)
+	return nil
 }
 
 // ListDMUsers returns all user IDs who received DMs for a PR.
@@ -236,8 +246,22 @@ func (s *FidoStore) WasProcessed(_ context.Context, eventKey string) bool {
 // MarkProcessed marks an event as processed.
 func (s *FidoStore) MarkProcessed(_ context.Context, eventKey string, ttl time.Duration) error {
 	s.eventsMu.Lock()
+	defer s.eventsMu.Unlock()
+
 	s.events[eventKey] = time.Now().Add(ttl)
-	s.eventsMu.Unlock()
+
+	// Inline cleanup if map grows too large to prevent memory exhaustion
+	if len(s.events) > maxEventMapSize {
+		now := time.Now()
+		for key, expiry := range s.events {
+			if now.After(expiry) {
+				delete(s.events, key)
+			}
+		}
+		slog.Debug("performed inline event map cleanup",
+			"remaining", len(s.events))
+	}
+
 	return nil
 }
 
@@ -325,15 +349,53 @@ func (s *FidoStore) RemovePendingDM(ctx context.Context, id string) error {
 
 // Cleanup removes expired entries.
 func (s *FidoStore) Cleanup(ctx context.Context) error {
+	now := time.Now()
+
 	// Clean up expired events from memory
 	s.eventsMu.Lock()
-	now := time.Now()
 	for key, expiry := range s.events {
 		if now.After(expiry) {
 			delete(s.events, key)
 		}
 	}
+	eventCount := len(s.events)
 	s.eventsMu.Unlock()
+
+	// Clean up stale dmUserIndex entries
+	// Remove entries for PRs that haven't been updated recently
+	s.dmUserIndexMu.Lock()
+	dmIndexCount := len(s.dmUserIndex)
+	// dmUserIndex entries older than dmInfoTTL are stale
+	// Since we don't track timestamps per entry, we rely on the underlying
+	// dmInfo cache to have evicted the data; if all users for a PR are gone
+	// from dmInfo, we can remove the index entry
+	for prURL, users := range s.dmUserIndex {
+		allGone := true
+		for userID := range users {
+			key := fmt.Sprintf("%s:%s", userID, prURL)
+			_, found, err := s.dmInfo.Get(ctx, key)
+			if err != nil {
+				slog.Debug("dmUserIndex cleanup: error checking dmInfo",
+					"key", key,
+					"error", err)
+			}
+			if found {
+				allGone = false
+				break
+			}
+		}
+		if allGone {
+			delete(s.dmUserIndex, prURL)
+		}
+	}
+	cleanedDMIndex := dmIndexCount - len(s.dmUserIndex)
+	s.dmUserIndexMu.Unlock()
+
+	if cleanedDMIndex > 0 {
+		slog.Debug("cleaned up stale dmUserIndex entries",
+			"removed", cleanedDMIndex,
+			"remaining", len(s.dmUserIndex))
+	}
 
 	// Clean up stale pending DMs
 	s.pendingMu.Lock()
@@ -341,6 +403,9 @@ func (s *FidoStore) Cleanup(ctx context.Context) error {
 
 	queue, _, err := s.pendingDMs.Get(ctx, pendingQueueKey)
 	if err != nil {
+		slog.Debug("cleanup: pending DM fetch info",
+			"events_remaining", eventCount,
+			"error", err)
 		return nil
 	}
 
@@ -349,12 +414,20 @@ func (s *FidoStore) Cleanup(ctx context.Context) error {
 	}
 
 	modified := false
+	removedPending := 0
 	for id := range queue.DMs {
 		dm := queue.DMs[id]
 		if now.Sub(dm.SendAt) > pendingDMTTL {
 			delete(queue.DMs, id)
 			modified = true
+			removedPending++
 		}
+	}
+
+	if removedPending > 0 {
+		slog.Debug("cleaned up stale pending DMs",
+			"removed", removedPending,
+			"remaining", len(queue.DMs))
 	}
 
 	if modified {

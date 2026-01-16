@@ -23,14 +23,14 @@ type SlashCommandHandler struct {
 
 // StatusGetter provides bot status information.
 type StatusGetter interface {
-	// GetStatus returns the current bot status for a guild.
-	GetStatus(guildID string) BotStatus
+	// Status returns the current bot status for a guild.
+	Status(ctx context.Context, guildID string) BotStatus
 }
 
 // ReportGetter provides PR report generation.
 type ReportGetter interface {
-	// GetReport generates a PR report for a user.
-	GetReport(ctx context.Context, guildID, userID string) (*PRReport, error)
+	// Report generates a PR report for a user.
+	Report(ctx context.Context, guildID, userID string) (*PRReport, error)
 }
 
 // BotStatus contains bot status information.
@@ -181,11 +181,12 @@ func (h *SlashCommandHandler) handleGooseCommand(
 }
 
 func (h *SlashCommandHandler) handleStatusCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	ctx := context.Background()
 	guildID := i.GuildID
 
 	var status BotStatus
 	if h.statusGetter != nil {
-		status = h.statusGetter.GetStatus(guildID)
+		status = h.statusGetter.Status(ctx, guildID)
 	}
 
 	connectionValue := "Disconnected"
@@ -269,7 +270,7 @@ func (h *SlashCommandHandler) generateAndSendReport(s *discordgo.Session, i *dis
 		return
 	}
 
-	report, err := h.reportGetter.GetReport(ctx, guildID, userID)
+	report, err := h.reportGetter.Report(ctx, guildID, userID)
 	if err != nil {
 		h.logger.Error("failed to generate report", "error", err, "user_id", userID)
 		h.editResponse(s, i, "Failed to generate report. Please try again later.", nil)
@@ -293,41 +294,41 @@ func (*SlashCommandHandler) formatReportEmbed(report *PRReport) *discordgo.Messa
 
 	// Incoming PRs section
 	if len(report.IncomingPRs) > 0 {
-		var incoming strings.Builder
+		var b strings.Builder
 		for i := range report.IncomingPRs {
 			pr := &report.IncomingPRs[i]
 			indicator := "◽"
 			if pr.IsBlocked {
 				indicator = "🔴"
 			}
-			incoming.WriteString(fmt.Sprintf("%s [%s#%d](%s) %s\n", indicator, pr.Repo, pr.Number, pr.URL, format.Truncate(pr.Title, 40)))
+			b.WriteString(fmt.Sprintf("%s [%s#%d](%s) %s\n", indicator, pr.Repo, pr.Number, pr.URL, format.Truncate(pr.Title, 40)))
 			if pr.Action != "" {
-				incoming.WriteString(fmt.Sprintf("   ↳ %s\n", pr.Action))
+				b.WriteString(fmt.Sprintf("   ↳ %s\n", pr.Action))
 			}
 		}
 		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
 			Name:  fmt.Sprintf("Incoming PRs (%d)", len(report.IncomingPRs)),
-			Value: incoming.String(),
+			Value: b.String(),
 		})
 	}
 
 	// Outgoing PRs section
 	if len(report.OutgoingPRs) > 0 {
-		var outgoing strings.Builder
+		var b strings.Builder
 		for i := range report.OutgoingPRs {
 			pr := &report.OutgoingPRs[i]
 			indicator := "◽"
 			if pr.IsBlocked {
 				indicator = "🟢"
 			}
-			outgoing.WriteString(fmt.Sprintf("%s [%s#%d](%s) %s\n", indicator, pr.Repo, pr.Number, pr.URL, format.Truncate(pr.Title, 40)))
+			b.WriteString(fmt.Sprintf("%s [%s#%d](%s) %s\n", indicator, pr.Repo, pr.Number, pr.URL, format.Truncate(pr.Title, 40)))
 			if pr.Action != "" {
-				outgoing.WriteString(fmt.Sprintf("   ↳ %s\n", pr.Action))
+				b.WriteString(fmt.Sprintf("   ↳ %s\n", pr.Action))
 			}
 		}
 		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
 			Name:  fmt.Sprintf("Your PRs (%d)", len(report.OutgoingPRs)),
-			Value: outgoing.String(),
+			Value: b.String(),
 		})
 	}
 

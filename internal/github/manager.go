@@ -143,7 +143,7 @@ func (c *OrgClient) Client() *github.Client {
 
 // InstallationToken returns a fresh installation token.
 func (c *OrgClient) InstallationToken(ctx context.Context) (string, error) {
-	return c.appClient.getInstallationToken(ctx, c.installationID)
+	return c.appClient.installationToken(ctx, c.installationID)
 }
 
 // Org returns the organization name.

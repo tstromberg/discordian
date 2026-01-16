@@ -8,10 +8,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/codeGROOVE-dev/retry"
 	"github.com/gorilla/websocket"
 )
 
@@ -198,8 +202,13 @@ func (c *SprinklerClient) connect(ctx context.Context) error {
 
 	// Check for error response
 	if respType, ok := response["type"].(string); ok && respType == "error" {
-		errCode, _ := response["error"].(string) //nolint:errcheck // optional field
-		msg, _ := response["message"].(string)   //nolint:errcheck // optional field
+		var errCode, msg string
+		if v, ok := response["error"].(string); ok {
+			errCode = v
+		}
+		if v, ok := response["message"].(string); ok {
+			msg = v
+		}
 		if errCode == "access_denied" || errCode == "authentication_failed" {
 			return &authError{message: fmt.Sprintf("%s: %s", errCode, msg)}
 		}
@@ -276,7 +285,10 @@ func (c *SprinklerClient) readLoop(ctx context.Context, conn *websocket.Conn) er
 		// Reset read deadline on any message
 		conn.SetReadDeadline(time.Now().Add(pongWait)) //nolint:errcheck,gosec // best-effort deadline
 
-		msgType, _ := msg["type"].(string) //nolint:errcheck // optional field
+		var msgType string
+		if v, ok := msg["type"].(string); ok {
+			msgType = v
+		}
 
 		// Handle ping/pong
 		if msgType == "ping" {
@@ -350,20 +362,52 @@ type PRURLInfo struct {
 	Number int
 }
 
+// validGitHubName matches valid GitHub owner/repo names.
+// GitHub allows alphanumeric, hyphens, underscores, and dots (with restrictions).
+var validGitHubName = regexp.MustCompile(`^[a-zA-Z0-9][-a-zA-Z0-9_.]*$`)
+
 // ParsePRURL extracts owner, repo, and number from a GitHub PR URL.
-func ParsePRURL(url string) (PRURLInfo, bool) {
-	// https://github.com/owner/repo/pull/123
-	parts := strings.Split(url, "/")
-	if len(parts) < 7 || parts[2] != "github.com" || parts[5] != "pull" {
+// Uses proper URL parsing to prevent injection attacks.
+func ParsePRURL(rawURL string) (PRURLInfo, bool) {
+	// Parse URL properly to validate structure
+	u, err := url.Parse(rawURL)
+	if err != nil {
 		return PRURLInfo{}, false
 	}
 
-	var n int
-	if _, err := fmt.Sscanf(parts[6], "%d", &n); err != nil {
+	// Must be HTTPS to github.com
+	if u.Scheme != "https" || u.Host != "github.com" {
 		return PRURLInfo{}, false
 	}
 
-	return PRURLInfo{Owner: parts[3], Repo: parts[4], Number: n}, true
+	// Path must be /owner/repo/pull/number
+	// Use TrimPrefix to get clean path
+	path := strings.TrimPrefix(u.Path, "/")
+	parts := strings.Split(path, "/")
+
+	if len(parts) != 4 || parts[2] != "pull" {
+		return PRURLInfo{}, false
+	}
+
+	owner, repo, numStr := parts[0], parts[1], parts[3]
+
+	// Validate owner and repo names against GitHub naming rules
+	if !validGitHubName.MatchString(owner) || !validGitHubName.MatchString(repo) {
+		return PRURLInfo{}, false
+	}
+
+	// Prevent path traversal attempts
+	if strings.Contains(owner, "..") || strings.Contains(repo, "..") {
+		return PRURLInfo{}, false
+	}
+
+	// Parse PR number
+	n, err := strconv.Atoi(numStr)
+	if err != nil || n <= 0 {
+		return PRURLInfo{}, false
+	}
+
+	return PRURLInfo{Owner: owner, Repo: repo, Number: n}, true
 }
 
 // FormatPRURL creates a GitHub PR URL from components.
@@ -387,7 +431,7 @@ func NewTurnClient(baseURL, token string) *TurnHTTPClient {
 	}
 }
 
-// Check calls the Turn API to analyze a PR.
+// Check calls the Turn API to analyze a PR with retry logic.
 func (c *TurnHTTPClient) Check(ctx context.Context, prURL, username string, updatedAt time.Time) (*CheckResponse, error) {
 	reqBody := map[string]any{
 		"url":        prURL,
@@ -406,42 +450,36 @@ func (c *TurnHTTPClient) Check(ctx context.Context, prURL, username string, upda
 		"username", username,
 		"updated_at", updatedAt.Format(time.RFC3339))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/validate", strings.NewReader(string(body)))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
+	var result CheckResponse
+	err = retry.Do(
+		func() error {
+			return c.doTurnRequest(ctx, body, prURL, &result)
+		},
+		retry.Context(ctx),
+		retry.Attempts(5),
+		retry.Delay(time.Second),
+		retry.MaxDelay(2*time.Minute),
+		retry.DelayType(retry.BackOffDelay),
+		retry.LastErrorOnly(true),
+		retry.OnRetry(func(n uint, err error) {
+			slog.Warn("Turn API call failed, retrying",
+				"url", prURL,
+				"attempt", n+1,
+				"error", err)
+		}),
+		retry.RetryIf(func(err error) bool {
+			// Don't retry on context cancellation
+			return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+		}),
+	)
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.token)
-
-	resp, err := c.client.Do(req)
 	duration := time.Since(start)
 	if err != nil {
-		slog.Error("Turn API request failed",
+		slog.Error("Turn API request failed after retries",
 			"url", prURL,
 			"error", err,
 			"duration_ms", duration.Milliseconds())
-		return nil, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close() //nolint:errcheck // response body must be closed
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body) //nolint:errcheck // best effort to log response body
-		slog.Error("Turn API returned error",
-			"url", prURL,
-			"status", resp.StatusCode,
-			"body", string(respBody),
-			"duration_ms", duration.Milliseconds())
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-
-	var result CheckResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		slog.Error("Turn API response decode failed",
-			"url", prURL,
-			"error", err,
-			"duration_ms", duration.Milliseconds())
-		return nil, fmt.Errorf("decode response: %w", err)
+		return nil, err
 	}
 
 	slog.Debug("Turn API response received",
@@ -454,4 +492,37 @@ func (c *TurnHTTPClient) Check(ctx context.Context, prURL, username string, upda
 		"duration_ms", duration.Milliseconds())
 
 	return &result, nil
+}
+
+// doTurnRequest performs a single Turn API request.
+func (c *TurnHTTPClient) doTurnRequest(ctx context.Context, body []byte, prURL string, result *CheckResponse) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/validate", strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // response body must be closed
+
+	if resp.StatusCode != http.StatusOK {
+		// Limit error response body to 4KB to prevent memory exhaustion attacks
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096)) //nolint:errcheck // best effort to log response body
+		slog.Debug("Turn API returned error",
+			"url", prURL,
+			"status", resp.StatusCode,
+			"body", string(respBody))
+		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+
+	return nil
 }

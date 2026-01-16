@@ -85,9 +85,8 @@ func TestChannelMessage(t *testing.T) {
 			want: []string{
 				EmojiNeedsReview,
 				"[repo#123]",
-				" · Fix the bug",  // Dot delimiter before title
-				" · alice",        // Dot delimiter before author
-				" • needs review", // State text with bullet delimiter
+				" · Fix the bug", // Dot delimiter before title
+				" · alice",       // Dot delimiter before author
 			},
 		},
 		{
@@ -106,7 +105,6 @@ func TestChannelMessage(t *testing.T) {
 				"[turnserver#18]",
 				" · Add GitLab/GitTea support", // Dot delimiter before title
 				" · tstromberg",                // Dot delimiter before author
-				" • tests pending",             // State text
 			},
 		},
 		{
@@ -124,7 +122,6 @@ func TestChannelMessage(t *testing.T) {
 				EmojiTestsBroken,
 				" · Breaking change",
 				" · bob",
-				" • tests failing",
 			},
 		},
 		{
@@ -142,7 +139,6 @@ func TestChannelMessage(t *testing.T) {
 				EmojiConflict,
 				" · Outdated branch",
 				" · charlie",
-				" • merge conflict",
 			},
 		},
 		{
@@ -156,15 +152,14 @@ func TestChannelMessage(t *testing.T) {
 				State:  StateChanges,
 				PRURL:  "https://github.com/org/repo/pull/42",
 				ActionUsers: []ActionUser{
-					{Username: "charlie", Mention: "<@123>", Action: "needs to review"},
+					{Username: "charlie", Mention: "<@123>", Action: "review"},
 				},
 			},
 			want: []string{
 				EmojiChanges,
 				" · New feature",
 				" · bob",
-				" • changes requested",            // State text
-				" • **needs to review** → <@123>", // Action users after state text
+				" • **review** → <@123>", // Action users (no state text)
 			},
 		},
 		{
@@ -361,16 +356,16 @@ func TestActionLabel(t *testing.T) {
 		action string
 		want   string
 	}{
-		{"review", "needs to review"},
-		{"re_review", "needs to re-review"},
-		{"approve", "needs to approve"},
-		{"resolve_comments", "needs to resolve comments"},
-		{"fix_tests", "needs to fix tests"},
-		{"fix_conflict", "needs to fix merge conflict"},
-		{"merge", "ready to merge"},
-		{"publish_draft", "needs to publish draft"},
-		{"request_reviewers", "needs to request reviewers"},
-		{"unknown_action", "unknown_action"},
+		{"review", "review"},
+		{"re_review", "re review"},
+		{"approve", "approve"},
+		{"resolve_comments", "resolve comments"},
+		{"fix_tests", "fix tests"},
+		{"fix_conflict", "fix conflict"},
+		{"merge", "merge"},
+		{"publish_draft", "publish draft"},
+		{"request_reviewers", "request reviewers"},
+		{"unknown_action", "unknown action"},
 		{"", ""},
 	}
 

@@ -121,7 +121,7 @@ type ActionUser struct {
 func ChannelMessage(p ChannelMessageParams) string {
 	emoji := StateEmoji(p.State)
 
-	// Format: emoji [repo#123](url?st=state) · Title · author • state_text • action → @users
+	// Format: emoji [repo#123](url?st=state) · Title · author • action → @users
 	var sb strings.Builder
 
 	sb.WriteString(emoji)
@@ -141,13 +141,6 @@ func ChannelMessage(p ChannelMessageParams) string {
 	// Author
 	sb.WriteString(" · ")
 	sb.WriteString(p.Author)
-
-	// State text (e.g., "tests pending")
-	stateText := StateText(p.State)
-	if stateText != "" {
-		sb.WriteString(" • ")
-		sb.WriteString(stateText)
-	}
 
 	// Action users - group by action
 	actionSuffix := ActionGroups(p.ActionUsers)
@@ -296,29 +289,9 @@ func StateFromAnalysis(p StateAnalysisParams) PRState {
 }
 
 // ActionLabel returns a human-readable label for an action.
+// Converts snake_case to space-separated words (matching Slacker format).
 func ActionLabel(action string) string {
-	switch action {
-	case "review":
-		return "needs to review"
-	case "re_review":
-		return "needs to re-review"
-	case "approve":
-		return "needs to approve"
-	case "resolve_comments":
-		return "needs to resolve comments"
-	case "fix_tests":
-		return "needs to fix tests"
-	case "fix_conflict":
-		return "needs to fix merge conflict"
-	case "merge":
-		return "ready to merge"
-	case "publish_draft":
-		return "needs to publish draft"
-	case "request_reviewers":
-		return "needs to request reviewers"
-	default:
-		return action
-	}
+	return strings.ReplaceAll(action, "_", " ")
 }
 
 // Truncate truncates a string to maxLen, adding "..." if truncated.

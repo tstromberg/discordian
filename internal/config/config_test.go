@@ -458,7 +458,7 @@ func TestManager_ReloadConfig_InvalidatesCache(t *testing.T) {
 	}
 
 	// ReloadConfig should fail (no client) but cache should be invalidated
-	_ = m.ReloadConfig(t.Context(), "testorg")
+	_ = m.ReloadConfig(t.Context(), "testorg") //nolint:errcheck // testing cache invalidation, not reload success
 
 	// Cache should be invalidated
 	_, found = m.cache.get("testorg")
@@ -499,9 +499,10 @@ users:
 	defer server.Close()
 
 	// Mock the GetContents endpoint
-	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, _ *http.Request) {
 		encoded := base64.StdEncoding.EncodeToString([]byte(yamlContent))
 		w.Header().Set("Content-Type", "application/json")
+		//nolint:errcheck // test handler
 		w.Write([]byte(`{
 			"type": "file",
 			"encoding": "base64",
@@ -541,9 +542,9 @@ func TestManager_LoadConfig_NotFound(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte(`{"message": "Not Found"}`))
+		_, _ = w.Write([]byte(`{"message": "Not Found"}`)) //nolint:errcheck // test handler
 	})
 
 	client := newTestGitHubClient(t, server.URL)
@@ -572,9 +573,10 @@ func TestManager_LoadConfig_InvalidYAML(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, _ *http.Request) {
 		encoded := base64.StdEncoding.EncodeToString([]byte("invalid: yaml: content: ["))
 		w.Header().Set("Content-Type", "application/json")
+		//nolint:errcheck // test handler
 		w.Write([]byte(`{
 			"type": "file",
 			"encoding": "base64",
@@ -607,9 +609,10 @@ func TestManager_fetchConfig_EmptyContent(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/repos/testorg/.codeGROOVE/contents/discord.yaml", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Return file with no content
+		//nolint:errcheck // test handler
 		w.Write([]byte(`{
 			"type": "file",
 			"encoding": "base64"

@@ -20,7 +20,47 @@ const (
 	pollOpenPRHours        = 24                     // Look back 24 hours for open PRs
 	pollClosedPRHours      = 1                      // Look back 1 hour for closed PRs
 	crossInstanceRaceDelay = 100 * time.Millisecond // Delay before creating to allow cross-instance race detection
+	maxTagTrackerEntries   = 5000                   // Max PRs to track before cleanup
+	lockCleanupInterval    = 10 * time.Minute       // How often to clean up unused locks
+	lockIdleTimeout        = 30 * time.Minute       // Remove locks not used for this duration
 )
+
+// timedLock wraps a mutex with last-access tracking for cleanup.
+type timedLock struct {
+	lastUsed time.Time
+	mu       sync.Mutex
+}
+
+// lockMap manages locks with automatic cleanup of idle entries.
+type lockMap struct {
+	locks sync.Map // key -> *timedLock
+}
+
+func (lm *lockMap) get(key string) *sync.Mutex {
+	val, _ := lm.locks.LoadOrStore(key, &timedLock{lastUsed: time.Now()})
+	tl := val.(*timedLock) //nolint:errcheck,forcetypeassert,revive // type assertion always succeeds - we control what's stored
+	tl.lastUsed = time.Now()
+	return &tl.mu
+}
+
+func (lm *lockMap) cleanup(idleTimeout time.Duration) int {
+	now := time.Now()
+	removed := 0
+	lm.locks.Range(func(key, val any) bool {
+		tl := val.(*timedLock) //nolint:errcheck,forcetypeassert,revive // type assertion always succeeds
+		// Only delete if lock is not currently held and is idle
+		if now.Sub(tl.lastUsed) > idleTimeout {
+			// Try to acquire lock before deleting to ensure not in use
+			if tl.mu.TryLock() {
+				tl.mu.Unlock()
+				lm.locks.Delete(key)
+				removed++
+			}
+		}
+		return true
+	})
+	return removed
+}
 
 // Coordinator orchestrates event processing for a GitHub organization.
 type Coordinator struct {
@@ -33,8 +73,8 @@ type Coordinator struct {
 	logger     *slog.Logger
 	eventSem   chan struct{}
 	tagTracker *tagTracker
-	prLocks    sync.Map // PR URL -> *sync.Mutex (serializes channel operations per PR)
-	dmLocks    sync.Map // userID:prURL -> *sync.Mutex (serializes DM operations per user+PR)
+	prLocks    lockMap // PR URL -> mutex (serializes channel operations per PR)
+	dmLocks    lockMap // userID:prURL -> mutex (serializes DM operations per user+PR)
 	org        string
 	wg         sync.WaitGroup
 }
@@ -120,7 +160,7 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 	}
 
 	// Lock per PR URL to prevent race conditions (duplicate threads/messages)
-	prLock := c.getPRLock(event.URL)
+	prLock := c.prLock(event.URL)
 	prLock.Lock()
 	defer prLock.Unlock()
 
@@ -178,7 +218,7 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 	}
 
 	// Queue DM notifications
-	c.queueDMNotifications(ctx, owner, repo, number, checkResp, prState, actionUsers)
+	c.queueDMNotifications(ctx, owner, repo, number, checkResp, prState)
 
 	// Mark as processed
 	if err := c.store.MarkProcessed(ctx, eventKey, eventDeduplicationTTL); err != nil {
@@ -476,7 +516,6 @@ func (c *Coordinator) queueDMNotifications(
 	number int,
 	checkResp *CheckResponse,
 	prState format.PRState,
-	_ []format.ActionUser,
 ) {
 	prURL := FormatPRURL(owner, repo, number)
 
@@ -516,7 +555,7 @@ func (c *Coordinator) processDMForUser(
 	}
 
 	// Lock per user+PR to prevent concurrent duplicate DMs
-	dmLock := c.getDMLock(discordID, prURL)
+	dmLock := c.dmLock(discordID, prURL)
 	dmLock.Lock()
 	defer dmLock.Unlock()
 
@@ -608,19 +647,14 @@ func (c *Coordinator) processDMForUser(
 			return
 		}
 
-		if err := c.discord.UpdateDM(ctx, dmInfo.ChannelID, dmInfo.MessageID, newMessage); err != nil {
-			c.logger.Warn("failed to update DM",
-				"error", err,
-				"user_id", discordID,
-				"pr_url", prURL)
-			// Fall through to potentially queue new DM
-		} else {
+		err := c.discord.UpdateDM(ctx, dmInfo.ChannelID, dmInfo.MessageID, newMessage)
+		if err == nil {
 			// Save updated DM info
 			dmInfo.MessageText = newMessage
 			dmInfo.LastState = string(prState)
 			dmInfo.SentAt = time.Now()
-			if err := c.store.SaveDMInfo(ctx, discordID, prURL, dmInfo); err != nil {
-				c.logger.Warn("failed to save updated DM info", "error", err)
+			if saveErr := c.store.SaveDMInfo(ctx, discordID, prURL, dmInfo); saveErr != nil {
+				c.logger.Warn("failed to save updated DM info", "error", saveErr)
 			}
 			c.logger.Info("updated DM notification",
 				"user_id", discordID,
@@ -629,6 +663,11 @@ func (c *Coordinator) processDMForUser(
 				"state", prState)
 			return
 		}
+		c.logger.Warn("failed to update DM",
+			"error", err,
+			"user_id", discordID,
+			"pr_url", prURL)
+		// Fall through to potentially queue new DM
 	}
 
 	// New DM - check delay configuration
@@ -667,12 +706,12 @@ func (c *Coordinator) processDMForUser(
 		c.logger.Warn("failed to queue DM",
 			"error", err,
 			"user", username)
-	} else {
-		c.logger.Debug("queued DM notification",
-			"user", username,
-			"discord_id", discordID,
-			"send_at", sendAt)
+		return
 	}
+	c.logger.Debug("queued DM notification",
+		"user", username,
+		"discord_id", discordID,
+		"send_at", sendAt)
 }
 
 // updateAllDMsForClosedPR updates DMs for all users who received notifications about this PR.
@@ -715,42 +754,47 @@ func (c *Coordinator) updateAllDMsForClosedPR(
 
 	// Update each user's DM
 	for _, discordID := range userIDs {
-		// Lock per user+PR
-		dmLock := c.getDMLock(discordID, prURL)
-		dmLock.Lock()
-
-		dmInfo, exists := c.store.DMInfo(ctx, discordID, prURL)
-		if exists && dmInfo.ChannelID != "" && dmInfo.MessageID != "" {
-			// Idempotency check
-			if dmInfo.LastState == string(prState) {
-				dmLock.Unlock()
-				continue
-			}
-
-			if err := c.discord.UpdateDM(ctx, dmInfo.ChannelID, dmInfo.MessageID, finalMessage); err != nil {
-				c.logger.Warn("failed to update DM for closed PR",
-					"error", err,
-					"user_id", discordID,
-					"pr_url", prURL)
-			} else {
-				dmInfo.MessageText = finalMessage
-				dmInfo.LastState = string(prState)
-				dmInfo.SentAt = time.Now()
-				if err := c.store.SaveDMInfo(ctx, discordID, prURL, dmInfo); err != nil {
-					c.logger.Warn("failed to save DM info", "error", err)
-				}
-				c.logger.Debug("updated DM for closed PR",
-					"user_id", discordID,
-					"pr_url", prURL,
-					"state", prState)
-			}
-		}
-
-		dmLock.Unlock()
+		c.updateDMForClosedPR(ctx, discordID, prURL, prState, finalMessage)
 	}
 
 	// Cancel any pending DMs for this PR
 	c.cancelPendingDMsForPR(ctx, prURL)
+}
+
+// updateDMForClosedPR updates a single user's DM for a closed PR.
+func (c *Coordinator) updateDMForClosedPR(ctx context.Context, discordID, prURL string, prState format.PRState, msg string) {
+	lock := c.dmLock(discordID, prURL)
+	lock.Lock()
+	defer lock.Unlock()
+
+	dmInfo, exists := c.store.DMInfo(ctx, discordID, prURL)
+	if !exists || dmInfo.ChannelID == "" || dmInfo.MessageID == "" {
+		return
+	}
+
+	// Idempotency check
+	if dmInfo.LastState == string(prState) {
+		return
+	}
+
+	if err := c.discord.UpdateDM(ctx, dmInfo.ChannelID, dmInfo.MessageID, msg); err != nil {
+		c.logger.Warn("failed to update DM for closed PR",
+			"error", err,
+			"user_id", discordID,
+			"pr_url", prURL)
+		return
+	}
+
+	dmInfo.MessageText = msg
+	dmInfo.LastState = string(prState)
+	dmInfo.SentAt = time.Now()
+	if err := c.store.SaveDMInfo(ctx, discordID, prURL, dmInfo); err != nil {
+		c.logger.Warn("failed to save DM info", "error", err)
+	}
+	c.logger.Debug("updated DM for closed PR",
+		"user_id", discordID,
+		"pr_url", prURL,
+		"state", prState)
 }
 
 // cancelPendingDMsForPR removes all queued DMs for a PR.
@@ -762,19 +806,20 @@ func (c *Coordinator) cancelPendingDMsForPR(ctx context.Context, prURL string) {
 	}
 
 	for _, dm := range pendingDMs {
-		if dm.PRURL == prURL {
-			if err := c.store.RemovePendingDM(ctx, dm.ID); err != nil {
-				c.logger.Warn("failed to cancel pending DM",
-					"dm_id", dm.ID,
-					"pr_url", prURL,
-					"error", err)
-			} else {
-				c.logger.Debug("cancelled pending DM for closed PR",
-					"dm_id", dm.ID,
-					"user_id", dm.UserID,
-					"pr_url", prURL)
-			}
+		if dm.PRURL != prURL {
+			continue
 		}
+		if err := c.store.RemovePendingDM(ctx, dm.ID); err != nil {
+			c.logger.Warn("failed to cancel pending DM",
+				"dm_id", dm.ID,
+				"pr_url", prURL,
+				"error", err)
+			continue
+		}
+		c.logger.Debug("cancelled pending DM for closed PR",
+			"dm_id", dm.ID,
+			"user_id", dm.UserID,
+			"pr_url", prURL)
 	}
 }
 
@@ -783,40 +828,40 @@ func (c *Coordinator) Wait() {
 	c.wg.Wait()
 }
 
-// getPRLock returns a mutex for serializing operations on a specific PR.
-func (c *Coordinator) getPRLock(prURL string) *sync.Mutex {
-	lock, _ := c.prLocks.LoadOrStore(prURL, &sync.Mutex{})
-	mu, ok := lock.(*sync.Mutex)
-	if !ok {
-		// Should never happen since we always store *sync.Mutex
-		mu = &sync.Mutex{}
-		c.prLocks.Store(prURL, mu)
-	}
-	return mu
+// prLock returns a mutex for serializing operations on a specific PR.
+func (c *Coordinator) prLock(url string) *sync.Mutex {
+	return c.prLocks.get(url)
 }
 
-// getDMLock returns a mutex for serializing DM operations for a specific user+PR.
-// This prevents duplicate DMs when concurrent events trigger notifications for the same user.
-func (c *Coordinator) getDMLock(userID, prURL string) *sync.Mutex {
-	key := userID + ":" + prURL
-	lock, _ := c.dmLocks.LoadOrStore(key, &sync.Mutex{})
-	mu, ok := lock.(*sync.Mutex)
-	if !ok {
-		mu = &sync.Mutex{}
-		c.dmLocks.Store(key, mu)
+// dmLock returns a mutex for serializing DM operations for a specific user+PR.
+func (c *Coordinator) dmLock(userID, prURL string) *sync.Mutex {
+	return c.dmLocks.get(userID + ":" + prURL)
+}
+
+// CleanupLocks removes idle locks to prevent unbounded memory growth.
+// Should be called periodically from the main event loop.
+func (c *Coordinator) CleanupLocks() {
+	prRemoved := c.prLocks.cleanup(lockIdleTimeout)
+	dmRemoved := c.dmLocks.cleanup(lockIdleTimeout)
+	if prRemoved > 0 || dmRemoved > 0 {
+		c.logger.Debug("cleaned up idle locks",
+			"pr_locks_removed", prRemoved,
+			"dm_locks_removed", dmRemoved)
 	}
-	return mu
 }
 
 // tagTracker tracks which users were tagged in channel messages.
+// Implements bounded storage to prevent memory exhaustion.
 type tagTracker struct {
 	tagged map[string]map[string]bool // prURL -> username -> tagged
+	order  []string                   // Insertion order for LRU-like cleanup
 	mu     sync.RWMutex
 }
 
 func newTagTracker() *tagTracker {
 	return &tagTracker{
 		tagged: make(map[string]map[string]bool),
+		order:  make([]string, 0, maxTagTrackerEntries),
 	}
 }
 
@@ -824,10 +869,27 @@ func (t *tagTracker) mark(prURL, username string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if t.tagged[prURL] == nil {
+	// Track insertion order for cleanup
+	isNew := t.tagged[prURL] == nil
+	if isNew {
 		t.tagged[prURL] = make(map[string]bool)
+		t.order = append(t.order, prURL)
 	}
 	t.tagged[prURL][username] = true
+
+	// Cleanup oldest entries if we exceed the limit
+	if len(t.tagged) > maxTagTrackerEntries {
+		// Remove oldest 10% to avoid frequent cleanups
+		toRemove := max(maxTagTrackerEntries/10, 1)
+		for i := 0; i < toRemove && len(t.order) > 0; i++ {
+			oldPR := t.order[0]
+			t.order = t.order[1:]
+			delete(t.tagged, oldPR)
+		}
+		slog.Debug("tag tracker cleanup performed",
+			"removed", toRemove,
+			"remaining", len(t.tagged))
+	}
 }
 
 func (t *tagTracker) wasTagged(prURL, username string) bool {
@@ -854,22 +916,22 @@ func (c *Coordinator) PollAndReconcile(ctx context.Context) {
 	openPRs, err := c.searcher.ListOpenPRs(ctx, c.org, pollOpenPRHours)
 	if err != nil {
 		c.logger.Error("failed to list open PRs", "error", err)
-	} else {
-		c.logger.Debug("found open PRs to reconcile", "count", len(openPRs))
-		for _, pr := range openPRs {
-			c.reconcilePR(ctx, pr)
-		}
+		openPRs = nil // Clear for final log
+	}
+	c.logger.Debug("found open PRs to reconcile", "count", len(openPRs))
+	for _, pr := range openPRs {
+		c.reconcilePR(ctx, pr)
 	}
 
 	// Poll closed PRs (closed in last hour) to catch terminal states
 	closedPRs, err := c.searcher.ListClosedPRs(ctx, c.org, pollClosedPRHours)
 	if err != nil {
 		c.logger.Error("failed to list closed PRs", "error", err)
-	} else {
-		c.logger.Debug("found closed PRs to reconcile", "count", len(closedPRs))
-		for _, pr := range closedPRs {
-			c.reconcilePR(ctx, pr)
-		}
+		closedPRs = nil // Clear for final log
+	}
+	c.logger.Debug("found closed PRs to reconcile", "count", len(closedPRs))
+	for _, pr := range closedPRs {
+		c.reconcilePR(ctx, pr)
 	}
 
 	c.logger.Info("PR poll and reconcile complete",
@@ -1017,6 +1079,10 @@ func (c *Coordinator) checkUserDailyReport(
 		// Call Turn API to analyze this PR for this user
 		checkResp, err := c.turn.Check(ctx, pr.URL, githubUsername, pr.UpdatedAt)
 		if err != nil {
+			c.logger.Debug("failed to check PR for user report",
+				"pr_url", pr.URL,
+				"github_user", githubUsername,
+				"error", err)
 			continue
 		}
 

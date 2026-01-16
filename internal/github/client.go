@@ -59,12 +59,12 @@ func NewAppClient(appID, privateKeyPEM string, logger *slog.Logger) (*AppClient,
 
 // ClientForOrg returns an authenticated GitHub client for an organization.
 func (c *AppClient) ClientForOrg(ctx context.Context, org string) (*github.Client, error) {
-	installationID, err := c.getInstallationID(ctx, org)
+	installationID, err := c.installationID(ctx, org)
 	if err != nil {
 		return nil, fmt.Errorf("get installation ID: %w", err)
 	}
 
-	token, err := c.getInstallationToken(ctx, installationID)
+	token, err := c.installationToken(ctx, installationID)
 	if err != nil {
 		return nil, fmt.Errorf("get installation token: %w", err)
 	}
@@ -75,7 +75,7 @@ func (c *AppClient) ClientForOrg(ctx context.Context, org string) (*github.Clien
 	return github.NewClient(tc), nil
 }
 
-func (c *AppClient) getInstallationID(ctx context.Context, org string) (int64, error) {
+func (c *AppClient) installationID(ctx context.Context, org string) (int64, error) {
 	// Check cache.
 	c.installationsMu.RLock()
 	if id, ok := c.installations[org]; ok {
@@ -113,7 +113,7 @@ func (c *AppClient) getInstallationID(ctx context.Context, org string) (int64, e
 	return 0, fmt.Errorf("no installation found for org: %s", org)
 }
 
-func (c *AppClient) getInstallationToken(ctx context.Context, installationID int64) (string, error) {
+func (c *AppClient) installationToken(ctx context.Context, installationID int64) (string, error) {
 	// Check cache.
 	c.tokensMu.RLock()
 	if entry, ok := c.tokens[installationID]; ok && time.Until(entry.expiresAt) > tokenRefreshBuffer {
@@ -171,11 +171,11 @@ func (c *AppClient) generateJWT() string {
 
 // TokenForOrg returns an installation token for an organization.
 func (c *AppClient) TokenForOrg(ctx context.Context, org string) (string, error) {
-	installationID, err := c.getInstallationID(ctx, org)
+	installationID, err := c.installationID(ctx, org)
 	if err != nil {
 		return "", err
 	}
-	return c.getInstallationToken(ctx, installationID)
+	return c.installationToken(ctx, installationID)
 }
 
 // HTTPClient returns an authenticated HTTP client for an organization.

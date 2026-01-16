@@ -8,8 +8,10 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/codeGROOVE-dev/retry"
 
 	"github.com/codeGROOVE-dev/discordian/internal/format"
 )
@@ -39,6 +41,22 @@ func New(token string) (*Client, error) {
 	}, nil
 }
 
+// retryableCtx wraps a function with standard retry configuration.
+func retryableCtx(ctx context.Context, fn func() error) error {
+	return retry.Do(
+		fn,
+		retry.Context(ctx),
+		retry.Attempts(3),
+		retry.Delay(500*time.Millisecond),
+		retry.MaxDelay(5*time.Second),
+		retry.DelayType(retry.BackOffDelay),
+		retry.LastErrorOnly(true),
+		retry.RetryIf(func(err error) bool {
+			return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+		}),
+	)
+}
+
 // SetGuildID sets the guild ID for this client.
 func (c *Client) SetGuildID(guildID string) {
 	c.mu.Lock()
@@ -53,9 +71,24 @@ func (c *Client) GuildID() string {
 	return c.guildID
 }
 
-// Open opens the WebSocket connection to Discord.
+// openTimeout is the maximum time to wait for Discord connection.
+const openTimeout = 30 * time.Second
+
+// Open opens the WebSocket connection to Discord with a timeout.
 func (c *Client) Open() error {
-	return c.session.Open()
+	done := make(chan error, 1)
+	go func() {
+		done <- c.session.Open()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(openTimeout):
+		// Try to close the session to clean up
+		c.session.Close() //nolint:errcheck,gosec // best-effort close on timeout
+		return errors.New("timeout waiting for Discord connection")
+	}
 }
 
 // Close closes the WebSocket connection.
@@ -320,7 +353,8 @@ func (c *Client) IsForumChannel(ctx context.Context, channelID string) bool {
 	return channelType == discordgo.ChannelTypeGuildForum
 }
 
-// LookupUserByUsername finds a Discord user ID by exact username match.
+// LookupUserByUsername finds a Discord user ID by username match.
+// Uses multi-tier matching: exact, case-insensitive, then prefix (if unambiguous).
 func (c *Client) LookupUserByUsername(ctx context.Context, username string) string {
 	c.mu.RLock()
 	if id, ok := c.userCache[username]; ok {
@@ -342,20 +376,142 @@ func (c *Client) LookupUserByUsername(ctx context.Context, username string) stri
 		return ""
 	}
 
-	for _, member := range members {
-		if member.User.Username != username {
-			continue
-		}
+	// Skip empty usernames
+	if username == "" {
+		slog.Debug("empty username provided")
+		return ""
+	}
 
+	slog.Debug("searching for user in guild",
+		"username", username,
+		"guild_id", guildID,
+		"total_members", len(members))
+
+	// Tier 1: Exact match (Username takes precedence over GlobalName)
+	for _, member := range members {
+		if member.User.Username == username {
+			c.mu.Lock()
+			c.userCache[username] = member.User.ID
+			c.mu.Unlock()
+
+			slog.Debug("found user by exact username match",
+				"username", username,
+				"user_id", member.User.ID,
+				"discord_username", member.User.Username,
+				"discord_global_name", member.User.GlobalName)
+
+			return member.User.ID
+		}
+	}
+	for _, member := range members {
+		if member.User.GlobalName == username {
+			c.mu.Lock()
+			c.userCache[username] = member.User.ID
+			c.mu.Unlock()
+
+			slog.Debug("found user by exact global name match",
+				"username", username,
+				"user_id", member.User.ID,
+				"discord_username", member.User.Username,
+				"discord_global_name", member.User.GlobalName)
+
+			return member.User.ID
+		}
+	}
+
+	// Tier 2: Case-insensitive match (Username takes precedence over GlobalName)
+	for _, member := range members {
+		if strings.EqualFold(member.User.Username, username) {
+			c.mu.Lock()
+			c.userCache[username] = member.User.ID
+			c.mu.Unlock()
+
+			slog.Info("found user by case-insensitive username match",
+				"username", username,
+				"user_id", member.User.ID,
+				"discord_username", member.User.Username,
+				"discord_global_name", member.User.GlobalName)
+
+			return member.User.ID
+		}
+	}
+	for _, member := range members {
+		if strings.EqualFold(member.User.GlobalName, username) {
+			c.mu.Lock()
+			c.userCache[username] = member.User.ID
+			c.mu.Unlock()
+
+			slog.Info("found user by case-insensitive global name match",
+				"username", username,
+				"user_id", member.User.ID,
+				"discord_username", member.User.Username,
+				"discord_global_name", member.User.GlobalName)
+
+			return member.User.ID
+		}
+	}
+
+	lowerUsername := strings.ToLower(username)
+
+	// Tier 3: Prefix match (only if unambiguous)
+	type prefixMatch struct {
+		member    *discordgo.Member
+		matchType string
+	}
+	var matches []prefixMatch
+
+	for _, member := range members {
+		usernamePrefix := strings.HasPrefix(strings.ToLower(member.User.Username), lowerUsername)
+		globalNamePrefix := strings.HasPrefix(strings.ToLower(member.User.GlobalName), lowerUsername)
+
+		if usernamePrefix {
+			matches = append(matches, prefixMatch{member: member, matchType: "username_prefix"})
+		} else if globalNamePrefix {
+			matches = append(matches, prefixMatch{member: member, matchType: "global_name_prefix"})
+		}
+	}
+
+	if len(matches) == 1 {
+		match := matches[0]
 		c.mu.Lock()
-		c.userCache[username] = member.User.ID
+		c.userCache[username] = match.member.User.ID
 		c.mu.Unlock()
 
-		slog.Debug("found user by username",
+		slog.Info("found user by unambiguous prefix match",
 			"username", username,
-			"user_id", member.User.ID)
+			"user_id", match.member.User.ID,
+			"match_type", match.matchType,
+			"discord_username", match.member.User.Username,
+			"discord_global_name", match.member.User.GlobalName)
 
-		return member.User.ID
+		return match.member.User.ID
+	}
+
+	if len(matches) > 1 {
+		slog.Warn("ambiguous prefix matches found, not using fuzzy match",
+			"username", username,
+			"match_count", len(matches))
+		for i, match := range matches {
+			if i >= 3 {
+				break
+			}
+			slog.Debug("ambiguous match candidate",
+				"username", username,
+				"discord_username", match.member.User.Username,
+				"discord_global_name", match.member.User.GlobalName)
+		}
+	}
+
+	// Log first 5 members to help debug
+	for i, member := range members {
+		if i >= 5 {
+			break
+		}
+		slog.Debug("sample guild member",
+			"index", i,
+			"discord_username", member.User.Username,
+			"discord_global_name", member.User.GlobalName,
+			"user_id", member.User.ID)
 	}
 
 	slog.Debug("user not found",
@@ -464,28 +620,28 @@ func (c *Client) ChannelMessages(ctx context.Context, channelID string, limit in
 }
 
 // FindForumThread searches for an existing forum thread by PR URL in the content.
-// Returns threadID, messageID if found.
+// Returns threadID, messageID if found. Uses retry logic for API calls.
 func (c *Client) FindForumThread(ctx context.Context, forumID, prURL string) (threadID, messageID string, found bool) {
-	// Get active threads in the forum
-	threads, err := c.session.GuildThreadsActive(c.guildID)
+	// Get active threads in the forum with retry
+	var threads *discordgo.ThreadsList
+	err := retryableCtx(ctx, func() error {
+		var err error
+		threads, err = c.session.GuildThreadsActive(c.guildID)
+		return err
+	})
 	if err != nil {
-		slog.Debug("failed to fetch active threads", "forum_id", forumID, "error", err)
+		slog.Warn("failed to fetch active threads after retries", "forum_id", forumID, "error", err)
 		return "", "", false
 	}
 
 	for _, thread := range threads.Threads {
-		// Check if thread is in this forum
 		if thread.ParentID != forumID {
 			continue
 		}
-
-		// Get the first message to check content
 		messages, err := c.session.ChannelMessages(thread.ID, 1, "", "", "")
 		if err != nil || len(messages) == 0 {
 			continue
 		}
-
-		// Check if the message contains the PR URL
 		if strings.Contains(messages[0].Content, prURL) {
 			slog.Debug("found existing forum thread",
 				"forum_id", forumID,
@@ -495,10 +651,15 @@ func (c *Client) FindForumThread(ctx context.Context, forumID, prURL string) (th
 		}
 	}
 
-	// Also check archived threads (recently archived)
-	archivedThreads, err := c.session.ThreadsArchived(forumID, nil, 50)
+	// Also check archived threads (recently archived) with retry
+	var archivedThreads *discordgo.ThreadsList
+	err = retryableCtx(ctx, func() error {
+		var err error
+		archivedThreads, err = c.session.ThreadsArchived(forumID, nil, 50)
+		return err
+	})
 	if err != nil {
-		slog.Debug("failed to fetch archived threads", "forum_id", forumID, "error", err)
+		slog.Warn("failed to fetch archived threads after retries", "forum_id", forumID, "error", err)
 		return "", "", false
 	}
 
@@ -507,7 +668,6 @@ func (c *Client) FindForumThread(ctx context.Context, forumID, prURL string) (th
 		if err != nil || len(messages) == 0 {
 			continue
 		}
-
 		if strings.Contains(messages[0].Content, prURL) {
 			slog.Debug("found existing archived forum thread",
 				"forum_id", forumID,
@@ -523,26 +683,26 @@ func (c *Client) FindForumThread(ctx context.Context, forumID, prURL string) (th
 // FindChannelMessage searches for an existing message containing the PR URL.
 // Returns messageID if found.
 func (c *Client) FindChannelMessage(ctx context.Context, channelID, prURL string) (messageID string, found bool) {
-	// Search recent messages (last 100)
-	messages, err := c.session.ChannelMessages(channelID, 100, "", "", "")
+	var messages []*discordgo.Message
+	err := retryableCtx(ctx, func() error {
+		var err error
+		messages, err = c.session.ChannelMessages(channelID, 100, "", "", "")
+		return err
+	})
 	if err != nil {
-		slog.Debug("failed to fetch channel messages", "channel_id", channelID, "error", err)
+		slog.Warn("failed to fetch channel messages after retries", "channel_id", channelID, "error", err)
 		return "", false
 	}
 
-	// Get bot's user ID
 	var botID string
 	if c.session.State != nil && c.session.State.User != nil {
 		botID = c.session.State.User.ID
 	}
 
 	for _, msg := range messages {
-		// Only check messages from the bot
 		if botID != "" && msg.Author.ID != botID {
 			continue
 		}
-
-		// Check if message contains the PR URL
 		if strings.Contains(msg.Content, prURL) {
 			slog.Debug("found existing channel message",
 				"channel_id", channelID,
@@ -558,33 +718,37 @@ func (c *Client) FindChannelMessage(ctx context.Context, channelID, prURL string
 // FindDMForPR searches for an existing DM about a specific PR.
 // Returns channelID, messageID if found.
 func (c *Client) FindDMForPR(ctx context.Context, userID, prURL string) (channelID, messageID string, found bool) {
-	// Get or create DM channel
-	channel, err := c.session.UserChannelCreate(userID)
+	var channel *discordgo.Channel
+	err := retryableCtx(ctx, func() error {
+		var err error
+		channel, err = c.session.UserChannelCreate(userID)
+		return err
+	})
 	if err != nil {
-		slog.Debug("failed to get DM channel", "user_id", userID, "error", err)
+		slog.Warn("failed to get DM channel after retries", "user_id", userID, "error", err)
 		return "", "", false
 	}
 
-	// Get bot's user ID
 	var botID string
 	if c.session.State != nil && c.session.State.User != nil {
 		botID = c.session.State.User.ID
 	}
 
-	// Search recent DMs (last 50)
-	messages, err := c.session.ChannelMessages(channel.ID, 50, "", "", "")
+	var messages []*discordgo.Message
+	err = retryableCtx(ctx, func() error {
+		var err error
+		messages, err = c.session.ChannelMessages(channel.ID, 50, "", "", "")
+		return err
+	})
 	if err != nil {
-		slog.Debug("failed to fetch DM messages", "channel_id", channel.ID, "error", err)
+		slog.Warn("failed to fetch DM messages after retries", "channel_id", channel.ID, "error", err)
 		return "", "", false
 	}
 
 	for _, msg := range messages {
-		// Only check messages from the bot
 		if botID != "" && msg.Author.ID != botID {
 			continue
 		}
-
-		// Check if message contains the PR URL
 		if strings.Contains(msg.Content, prURL) {
 			slog.Debug("found existing DM for PR",
 				"user_id", userID,
@@ -598,8 +762,8 @@ func (c *Client) FindDMForPR(ctx context.Context, userID, prURL string) (channel
 	return "", "", false
 }
 
-// GetMessageContent retrieves the content of a specific message.
-func (c *Client) GetMessageContent(ctx context.Context, channelID, messageID string) (string, error) {
+// MessageContent retrieves the content of a specific message.
+func (c *Client) MessageContent(ctx context.Context, channelID, messageID string) (string, error) {
 	msg, err := c.session.ChannelMessage(channelID, messageID)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch message: %w", err)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"testing"
@@ -20,6 +21,67 @@ type mockStateStore struct {
 	pendingDMs       []*state.PendingDM
 	dailyReportInfos map[string]state.DailyReportInfo
 }
+
+type mockTurnClient struct {
+	response   *bot.CheckResponse
+	checkError error
+}
+
+func (m *mockTurnClient) Check(_ context.Context, _, _ string, _ time.Time) (*bot.CheckResponse, error) {
+	if m.checkError != nil {
+		return nil, m.checkError
+	}
+	return m.response, nil
+}
+
+type mockConfigManager struct {
+	configs map[string]*config.DiscordConfig
+}
+
+func (m *mockConfigManager) LoadConfig(_ context.Context, _ string) error {
+	return nil
+}
+
+func (m *mockConfigManager) ReloadConfig(_ context.Context, _ string) error {
+	return nil
+}
+
+func (m *mockConfigManager) Config(org string) (*config.DiscordConfig, bool) {
+	if m.configs == nil {
+		return nil, false
+	}
+	cfg, ok := m.configs[org]
+	return cfg, ok
+}
+
+func (m *mockConfigManager) ChannelsForRepo(_, _ string) []string {
+	return []string{}
+}
+
+func (m *mockConfigManager) ChannelType(_, _ string) string {
+	return "text"
+}
+
+func (m *mockConfigManager) DiscordUserID(_, _ string) string {
+	return ""
+}
+
+func (m *mockConfigManager) ReminderDMDelay(_, _ string) int {
+	return 0
+}
+
+func (m *mockConfigManager) When(_, _ string) string {
+	return ""
+}
+
+func (m *mockConfigManager) GuildID(org string) string {
+	if cfg, ok := m.Config(org); ok {
+		return cfg.Global.GuildID
+	}
+	return ""
+}
+
+func (m *mockConfigManager) SetGitHubClient(_ string, _ any) {}
 
 func (m *mockStateStore) Thread(_ context.Context, _, _ string, _ int, _ string) (state.ThreadInfo, bool) {
 	return state.ThreadInfo{}, false
@@ -190,6 +252,7 @@ func TestCoordinatorManager_Report_Errors(t *testing.T) {
 			startTime:      time.Now(),
 			store:          &mockStateStore{},
 			configManager:  config.New(),
+			reverseMapper:  usermapping.NewReverseMapper(),
 		}
 
 		_, err := cm.Report(context.Background(), "unknown-guild", "user123")
@@ -202,7 +265,17 @@ func TestCoordinatorManager_Report_Errors(t *testing.T) {
 		}
 	})
 
-	t.Run("no Discord client for guild", func(t *testing.T) {
+	t.Run("no GitHub username mapping", func(t *testing.T) {
+		mockCfg := &mockConfigManager{
+			configs: map[string]*config.DiscordConfig{
+				"test-org": {
+					Global: config.GlobalConfig{
+						GuildID: "test-guild",
+					},
+				},
+			},
+		}
+
 		cm := &coordinatorManager{
 			active: map[string]context.CancelFunc{
 				"test-org": func() {},
@@ -213,13 +286,17 @@ func TestCoordinatorManager_Report_Errors(t *testing.T) {
 			lastEventTime:  make(map[string]time.Time),
 			startTime:      time.Now(),
 			store:          &mockStateStore{},
-			configManager:  config.New(),
+			configManager:  mockCfg,
+			reverseMapper:  usermapping.NewReverseMapper(),
 		}
 
-		_, err := cm.Report(context.Background(), "test-guild", "user123")
+		_, err := cm.Report(context.Background(), "test-guild", "user-without-mapping")
 
 		if err == nil {
-			t.Error("expected error for missing Discord client")
+			t.Error("expected error for no GitHub username mapping")
+		}
+		if err != nil && err.Error() != "no GitHub username mapping found for Discord user" {
+			t.Errorf("unexpected error message: %v", err)
 		}
 	})
 }
@@ -373,6 +450,7 @@ func TestCoordinatorManager_UserMappings(t *testing.T) {
 			active:        make(map[string]context.CancelFunc),
 			coordinators:  make(map[string]*bot.Coordinator),
 			configManager: config.New(),
+			reverseMapper: usermapping.NewReverseMapper(),
 		}
 
 		mappings, err := cm.UserMappings(context.Background(), "unknown-guild")
@@ -381,6 +459,42 @@ func TestCoordinatorManager_UserMappings(t *testing.T) {
 		}
 		if mappings.TotalUsers != 0 {
 			t.Errorf("TotalUsers = %d, want 0", mappings.TotalUsers)
+		}
+	})
+
+	t.Run("with config mappings", func(t *testing.T) {
+		mockCfg := &mockConfigManager{
+			configs: map[string]*config.DiscordConfig{
+				"test-org": {
+					Global: config.GlobalConfig{
+						GuildID: "test-guild",
+					},
+					Users: map[string]string{
+						"github-user1": "discord-id-1",
+						"github-user2": "discord-id-2",
+					},
+				},
+			},
+		}
+
+		cm := &coordinatorManager{
+			active: map[string]context.CancelFunc{
+				"test-org": func() {},
+			},
+			coordinators:  make(map[string]*bot.Coordinator),
+			configManager: mockCfg,
+			reverseMapper: usermapping.NewReverseMapper(),
+		}
+
+		mappings, err := cm.UserMappings(context.Background(), "test-guild")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if len(mappings.ConfigMappings) != 2 {
+			t.Errorf("ConfigMappings = %d, want 2", len(mappings.ConfigMappings))
+		}
+		if mappings.TotalUsers != 2 {
+			t.Errorf("TotalUsers = %d, want 2", mappings.TotalUsers)
 		}
 	})
 }
@@ -399,6 +513,45 @@ func TestCoordinatorManager_ChannelMappings(t *testing.T) {
 		}
 		if mappings.TotalRepos != 0 {
 			t.Errorf("TotalRepos = %d, want 0", mappings.TotalRepos)
+		}
+	})
+
+	t.Run("with channel and repo mappings", func(t *testing.T) {
+		mockCfg := &mockConfigManager{
+			configs: map[string]*config.DiscordConfig{
+				"test-org": {
+					Global: config.GlobalConfig{
+						GuildID: "test-guild",
+					},
+					Channels: map[string]config.ChannelConfig{
+						"channel-1": {
+							Repos: []string{"repo1", "repo2"},
+						},
+						"channel-2": {
+							Repos: []string{"repo3"},
+						},
+					},
+				},
+			},
+		}
+
+		cm := &coordinatorManager{
+			active: map[string]context.CancelFunc{
+				"test-org": func() {},
+			},
+			coordinators:  make(map[string]*bot.Coordinator),
+			configManager: mockCfg,
+		}
+
+		mappings, err := cm.ChannelMappings(context.Background(), "test-guild")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if len(mappings.RepoMappings) != 3 {
+			t.Errorf("RepoMappings = %d, want 3", len(mappings.RepoMappings))
+		}
+		if mappings.TotalRepos != 3 {
+			t.Errorf("TotalRepos = %d, want 3", mappings.TotalRepos)
 		}
 	})
 }
@@ -634,4 +787,178 @@ func TestCoordinatorManager_DailyReport_DebugInfo(t *testing.T) {
 func TestCoordinatorManager_DailyReportGetter_Interface(t *testing.T) {
 	// Test that coordinatorManager implements DailyReportGetter interface
 	var _ discord.DailyReportGetter = (*coordinatorManager)(nil)
+}
+
+func TestCoordinatorManager_Status_WithMetrics(t *testing.T) {
+	mockStore := &mockStateStore{
+		pendingDMs: []*state.PendingDM{
+			{ID: "1", UserID: "user1"},
+			{ID: "2", UserID: "user2"},
+		},
+	}
+
+	cm := &coordinatorManager{
+		active: map[string]context.CancelFunc{
+			"org1": func() {},
+			"org2": func() {},
+		},
+		discordClients: make(map[string]*discord.Client),
+		slashHandlers:  make(map[string]*discord.SlashCommandHandler),
+		coordinators:   make(map[string]*bot.Coordinator),
+		lastEventTime: map[string]time.Time{
+			"org1": time.Now().Add(-5 * time.Minute),
+		},
+		startTime:     time.Now().Add(-2 * time.Hour),
+		store:         mockStore,
+		configManager: config.New(),
+		dailyReports:  5,
+		dmsSent:       10,
+		channelMsgs:   50,
+	}
+
+	status := cm.Status(context.Background(), "test-guild")
+
+	if !status.Connected {
+		t.Error("Status() Connected = false, want true")
+	}
+	if len(status.ConnectedOrgs) != 2 {
+		t.Errorf("Status() ConnectedOrgs = %d, want 2", len(status.ConnectedOrgs))
+	}
+	if status.PendingDMs != 2 {
+		t.Errorf("Status() PendingDMs = %d, want 2", status.PendingDMs)
+	}
+	if status.DailyReportsSent != 5 {
+		t.Errorf("Status() DailyReportsSent = %d, want 5", status.DailyReportsSent)
+	}
+	if status.DMsSent != 10 {
+		t.Errorf("Status() DMsSent = %d, want 10", status.DMsSent)
+	}
+	if status.ChannelMessagesSent != 50 {
+		t.Errorf("Status() ChannelMessagesSent = %d, want 50", status.ChannelMessagesSent)
+	}
+	if status.UptimeSeconds < 7100 || status.UptimeSeconds > 7300 {
+		t.Errorf("Status() UptimeSeconds = %d, want ~7200", status.UptimeSeconds)
+	}
+}
+
+func TestAnalyzePRForReport(t *testing.T) {
+	t.Run("invalid PR URL", func(t *testing.T) {
+		pr := bot.PRSearchResult{
+			URL:       "not-a-valid-url",
+			UpdatedAt: time.Now(),
+		}
+
+		result := analyzePRForReport(context.Background(), pr, "testuser", nil)
+
+		if result != nil {
+			t.Error("expected nil result for invalid PR URL")
+		}
+	})
+
+	t.Run("Turn API error", func(t *testing.T) {
+		mockTurn := &mockTurnClient{
+			checkError: errors.New("API error"),
+		}
+
+		pr := bot.PRSearchResult{
+			URL:       "https://github.com/testorg/testrepo/pull/123",
+			UpdatedAt: time.Now(),
+		}
+
+		result := analyzePRForReport(context.Background(), pr, "testuser", mockTurn)
+
+		if result != nil {
+			t.Error("expected nil result when Turn API fails")
+		}
+	})
+
+	t.Run("successful PR analysis with action", func(t *testing.T) {
+		mockTurn := &mockTurnClient{
+			response: &bot.CheckResponse{
+				PullRequest: bot.PRInfo{
+					Author: "author1",
+					Title:  "Test PR",
+					Merged: false,
+					Closed: false,
+					Draft:  false,
+				},
+				Analysis: bot.Analysis{
+					WorkflowState: "review",
+					Approved:      false,
+					Checks: bot.Checks{
+						Failing: 0,
+						Pending: 0,
+						Waiting: 0,
+					},
+					NextAction: map[string]bot.Action{
+						"testuser": {
+							Kind: "review",
+						},
+					},
+				},
+			},
+		}
+
+		pr := bot.PRSearchResult{
+			URL:       "https://github.com/testorg/testrepo/pull/123",
+			UpdatedAt: time.Now(),
+		}
+
+		result := analyzePRForReport(context.Background(), pr, "testuser", mockTurn)
+
+		if result == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if result.Repo != "testrepo" {
+			t.Errorf("Repo = %q, want %q", result.Repo, "testrepo")
+		}
+		if result.Number != 123 {
+			t.Errorf("Number = %d, want 123", result.Number)
+		}
+		if result.Title != "Test PR" {
+			t.Errorf("Title = %q, want %q", result.Title, "Test PR")
+		}
+		if result.Author != "author1" {
+			t.Errorf("Author = %q, want %q", result.Author, "author1")
+		}
+		if result.Action == "" {
+			t.Error("expected non-empty action")
+		}
+	})
+
+	t.Run("blocked PR", func(t *testing.T) {
+		mockTurn := &mockTurnClient{
+			response: &bot.CheckResponse{
+				PullRequest: bot.PRInfo{
+					Author: "author1",
+					Title:  "Blocked PR",
+					Merged: false,
+					Closed: false,
+					Draft:  false,
+				},
+				Analysis: bot.Analysis{
+					MergeConflict: true,
+					WorkflowState: "conflict",
+					Checks: bot.Checks{
+						Failing: 0,
+					},
+					NextAction: map[string]bot.Action{},
+				},
+			},
+		}
+
+		pr := bot.PRSearchResult{
+			URL:       "https://github.com/testorg/testrepo/pull/456",
+			UpdatedAt: time.Now(),
+		}
+
+		result := analyzePRForReport(context.Background(), pr, "testuser", mockTurn)
+
+		if result == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if !result.IsBlocked {
+			t.Error("expected IsBlocked = true for PR with merge conflict")
+		}
+	})
 }

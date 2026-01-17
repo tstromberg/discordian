@@ -174,9 +174,9 @@ func run(ctx context.Context, cancel context.CancelFunc) int {
 	return 0
 }
 
-// configAdapter adapts config.Manager to usermapping.ReverseConfigLookup.
+// configAdapter adapts bot.ConfigManager to usermapping.ReverseConfigLookup.
 type configAdapter struct {
-	mgr *config.Manager
+	mgr bot.ConfigManager
 }
 
 func (ca *configAdapter) Config(org string) (usermapping.OrgConfig, bool) {
@@ -194,11 +194,11 @@ type coordinatorManager struct {
 	notifyMgr      *notify.Manager
 	reverseMapper  *usermapping.ReverseMapper
 	active         map[string]context.CancelFunc
-	guildManager   *discord.GuildManager
+	guildManager   DiscordGuildManager
 	failed         map[string]time.Time
 	coordinators   map[string]*bot.Coordinator
-	configManager  *config.Manager
-	githubManager  *github.Manager
+	configManager  bot.ConfigManager
+	githubManager  GitHubManager
 	cfg            config.ServerConfig
 	dmsSent        int64
 	dailyReports   int64

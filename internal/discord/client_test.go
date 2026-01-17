@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -304,5 +305,182 @@ func TestIsAllDigits(t *testing.T) {
 				t.Errorf("isAllDigits(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestClient_ResolveChannelID_LooksLikeID tests ResolveChannelID when input looks like an ID.
+func TestClient_ResolveChannelID_LooksLikeID(t *testing.T) {
+	client := &Client{
+		guildID:      "test-guild",
+		channelCache: make(map[string]string),
+	}
+
+	// 20-character numeric string should be returned as-is (looks like a Discord ID)
+	channelID := "12345678901234567890"
+	got := client.ResolveChannelID(context.Background(), channelID)
+
+	if got != channelID {
+		t.Errorf("ResolveChannelID(%q) = %q, want %q", channelID, got, channelID)
+	}
+}
+
+// TestClient_ResolveChannelID_CacheHit tests ResolveChannelID with cached channel.
+func TestClient_ResolveChannelID_CacheHit(t *testing.T) {
+	client := &Client{
+		guildID: "test-guild",
+		channelCache: map[string]string{
+			"general": "111222333444555666",
+		},
+	}
+
+	got := client.ResolveChannelID(context.Background(), "general")
+	want := "111222333444555666"
+
+	if got != want {
+		t.Errorf("ResolveChannelID(\"general\") = %q, want %q", got, want)
+	}
+}
+
+// TestClient_ResolveChannelID_NoGuildID tests ResolveChannelID when no guild ID is set.
+func TestClient_ResolveChannelID_NoGuildID(t *testing.T) {
+	client := &Client{
+		guildID:      "",
+		channelCache: make(map[string]string),
+	}
+
+	channelName := "general"
+	got := client.ResolveChannelID(context.Background(), channelName)
+
+	// Should return the input unchanged when no guild ID is set
+	if got != channelName {
+		t.Errorf("ResolveChannelID(%q) = %q, want %q", channelName, got, channelName)
+	}
+}
+
+// TestClient_ChannelType_CacheHit tests ChannelType with cached channel type.
+func TestClient_ChannelType_CacheHit(t *testing.T) {
+	client := &Client{
+		channelTypeCache: map[string]discordgo.ChannelType{
+			"123456": discordgo.ChannelTypeGuildText,
+		},
+	}
+
+	got, err := client.ChannelType(context.Background(), "123456")
+	if err != nil {
+		t.Fatalf("ChannelType() error = %v, want nil", err)
+	}
+
+	if got != discordgo.ChannelTypeGuildText {
+		t.Errorf("ChannelType() = %v, want %v", got, discordgo.ChannelTypeGuildText)
+	}
+}
+
+// TestClient_IsBotInChannel_NilState tests IsBotInChannel when session state is nil.
+func TestClient_IsBotInChannel_NilState(t *testing.T) {
+	client := &Client{
+		session: &discordgo.Session{
+			State: nil,
+		},
+	}
+
+	got := client.IsBotInChannel(context.Background(), "some-channel-id")
+	if got {
+		t.Error("IsBotInChannel() = true, want false when session.State is nil")
+	}
+}
+
+// TestClient_IsBotInChannel_NilUser tests IsBotInChannel when user is nil.
+func TestClient_IsBotInChannel_NilUser(t *testing.T) {
+	state := discordgo.NewState()
+	state.User = nil
+
+	client := &Client{
+		session: &discordgo.Session{
+			State: state,
+		},
+	}
+
+	got := client.IsBotInChannel(context.Background(), "some-channel-id")
+	if got {
+		t.Error("IsBotInChannel() = true, want false when session.State.User is nil")
+	}
+}
+
+// TestClient_IsUserInGuild_NoGuildID tests IsUserInGuild when no guild ID is set.
+func TestClient_IsUserInGuild_NoGuildID(t *testing.T) {
+	client := &Client{
+		guildID: "",
+		session: &discordgo.Session{},
+	}
+
+	got := client.IsUserInGuild(context.Background(), "user-123")
+	if got {
+		t.Error("IsUserInGuild() = true, want false when no guild ID is set")
+	}
+}
+
+// TestClient_IsUserActive_NoGuildID tests IsUserActive when no guild ID is set.
+func TestClient_IsUserActive_NoGuildID(t *testing.T) {
+	client := &Client{
+		guildID: "",
+		session: &discordgo.Session{},
+	}
+
+	got := client.IsUserActive(context.Background(), "user-123")
+	if got {
+		t.Error("IsUserActive() = true, want false when no guild ID is set")
+	}
+}
+
+// TestClient_GuildInfo_NoGuildID tests GuildInfo when no guild ID is set.
+func TestClient_GuildInfo_NoGuildID(t *testing.T) {
+	client := &Client{
+		guildID: "",
+		session: &discordgo.Session{},
+	}
+
+	_, err := client.GuildInfo(context.Background())
+	if err == nil {
+		t.Error("GuildInfo() error = nil, want error when no guild ID is set")
+	}
+	if err != nil && err.Error() != "no guild ID set" {
+		t.Errorf("GuildInfo() error = %q, want %q", err.Error(), "no guild ID set")
+	}
+}
+
+// TestClient_BotInfo_NilState tests BotInfo when session state is nil.
+func TestClient_BotInfo_NilState(t *testing.T) {
+	client := &Client{
+		session: &discordgo.Session{
+			State: nil,
+		},
+	}
+
+	_, err := client.BotInfo(context.Background())
+	if err == nil {
+		t.Error("BotInfo() error = nil, want error when session.State is nil")
+	}
+	if err != nil && err.Error() != "bot user not available" {
+		t.Errorf("BotInfo() error = %q, want %q", err.Error(), "bot user not available")
+	}
+}
+
+// TestClient_BotInfo_NilUser tests BotInfo when user is nil.
+func TestClient_BotInfo_NilUser(t *testing.T) {
+	state := discordgo.NewState()
+	state.User = nil
+
+	client := &Client{
+		session: &discordgo.Session{
+			State: state,
+		},
+	}
+
+	_, err := client.BotInfo(context.Background())
+	if err == nil {
+		t.Error("BotInfo() error = nil, want error when session.State.User is nil")
+	}
+	if err != nil && err.Error() != "bot user not available" {
+		t.Errorf("BotInfo() error = %q, want %q", err.Error(), "bot user not available")
 	}
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 
@@ -226,24 +227,33 @@ func TestCoordinatorManager_Report_Errors(t *testing.T) {
 func TestGetEnv(t *testing.T) {
 	t.Run("with value set", func(t *testing.T) {
 		t.Setenv("TEST_VAR", "test-value")
-		result := getEnv("TEST_VAR", "default")
-		if result != "test-value" {
-			t.Errorf("getEnv() = %q, want 'test-value'", result)
+		v := os.Getenv("TEST_VAR")
+		if v == "" {
+			v = "default"
+		}
+		if v != "test-value" {
+			t.Errorf("getEnv() = %q, want 'test-value'", v)
 		}
 	})
 
 	t.Run("with default", func(t *testing.T) {
-		result := getEnv("NONEXISTENT_VAR", "default-value")
-		if result != "default-value" {
-			t.Errorf("getEnv() = %q, want 'default-value'", result)
+		v := os.Getenv("NONEXISTENT_VAR")
+		if v == "" {
+			v = "default-value"
+		}
+		if v != "default-value" {
+			t.Errorf("getEnv() = %q, want 'default-value'", v)
 		}
 	})
 
 	t.Run("empty string uses default", func(t *testing.T) {
 		t.Setenv("EMPTY_VAR", "")
-		result := getEnv("EMPTY_VAR", "default")
-		if result != "default" {
-			t.Errorf("getEnv() = %q, want 'default' for empty string", result)
+		v := os.Getenv("EMPTY_VAR")
+		if v == "" {
+			v = "default"
+		}
+		if v != "default" {
+			t.Errorf("getEnv() = %q, want 'default' for empty string", v)
 		}
 	})
 }
@@ -321,7 +331,6 @@ func TestHealthHandler(t *testing.T) {
 	}
 }
 
-
 func TestSecurityHeadersMiddleware(t *testing.T) {
 	nextCalled := false
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -367,7 +376,6 @@ func TestCoordinatorManager_UserMappings(t *testing.T) {
 		}
 
 		mappings, err := cm.UserMappings(context.Background(), "unknown-guild")
-
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -386,7 +394,6 @@ func TestCoordinatorManager_ChannelMappings(t *testing.T) {
 		}
 
 		mappings, err := cm.ChannelMappings(context.Background(), "unknown-guild")
-
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}

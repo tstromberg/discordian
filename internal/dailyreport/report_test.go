@@ -291,7 +291,7 @@ func TestRandomGreeting(t *testing.T) {
 		// Call it multiple times and check we get variation
 		// (This is probabilistic but with 20 greetings, very likely to get different ones)
 		greetings := make(map[string]bool)
-		for i := 0; i < 5; i++ {
+		for range 5 {
 			g := randomGreeting()
 			greetings[g] = true
 		}

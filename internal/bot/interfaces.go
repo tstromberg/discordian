@@ -1,4 +1,6 @@
 // Package bot provides the core bot coordinator logic.
+//
+//nolint:revive // Package defines bot interfaces and API types (13 public types for API surface)
 package bot
 
 import (
@@ -10,6 +12,8 @@ import (
 )
 
 // DiscordClient defines Discord operations needed by the bot.
+//
+//nolint:interfacebloat // Discord client has many operations (messages, forums, DMs, lookups)
 type DiscordClient interface {
 	// Text channel operations
 	PostMessage(ctx context.Context, channelID, text string) (messageID string, err error)
@@ -57,6 +61,8 @@ type ConfigManager interface {
 }
 
 // StateStore defines state persistence operations.
+//
+//nolint:interfacebloat // State store handles threads, DMs, events, and reports
 type StateStore interface {
 	Thread(ctx context.Context, owner, repo string, number int, channelID string) (state.ThreadInfo, bool)
 	SaveThread(ctx context.Context, owner, repo string, number int, channelID string, info state.ThreadInfo) error

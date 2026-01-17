@@ -11,7 +11,6 @@ import (
 	"github.com/codeGROOVE-dev/discordian/internal/discord"
 	"github.com/codeGROOVE-dev/discordian/internal/format"
 	"github.com/codeGROOVE-dev/discordian/internal/state"
-	"github.com/codeGROOVE-dev/discordian/internal/usermapping"
 	"github.com/google/uuid"
 )
 
@@ -69,7 +68,7 @@ type Coordinator struct {
 	config     ConfigManager
 	store      StateStore
 	turn       TurnClient
-	userMapper UserMapper
+	UserMapper UserMapper
 	searcher   PRSearcher
 	logger     *slog.Logger
 	eventSem   chan struct{}
@@ -105,7 +104,7 @@ func NewCoordinator(cfg CoordinatorConfig) *Coordinator {
 		config:     cfg.Config,
 		store:      cfg.Store,
 		turn:       cfg.Turn,
-		userMapper: cfg.UserMapper,
+		UserMapper: cfg.UserMapper,
 		searcher:   cfg.Searcher,
 		logger:     logger.With("org", cfg.Org),
 		eventSem:   make(chan struct{}, maxConcurrentEvents),
@@ -163,7 +162,7 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 	}
 
 	// Lock per PR URL to prevent duplicate threads/messages
-	prLock := c.prLock(event.URL)
+	prLock := c.prLocks.get(event.URL)
 	prLock.Lock()
 	defer prLock.Unlock()
 
@@ -248,8 +247,8 @@ func (c *Coordinator) buildActionUsers(ctx context.Context, checkResp *CheckResp
 		}
 
 		mention := username
-		if c.userMapper != nil {
-			mention = c.userMapper.Mention(ctx, username)
+		if c.UserMapper != nil {
+			mention = c.UserMapper.Mention(ctx, username)
 		}
 
 		actionLabel := format.ActionLabel(action.Kind)
@@ -408,7 +407,7 @@ func (c *Coordinator) processChannel(
 
 	// Auto-detect forum channels from Discord API
 	if c.discord.IsForumChannel(ctx, channelID) {
-		return c.processForumChannel(ctx, channelProcessParams{
+		return c.processForumChannel(ctx, &channelProcessParams{
 			channelID:  channelID,
 			owner:      owner,
 			repo:       repo,
@@ -420,7 +419,7 @@ func (c *Coordinator) processChannel(
 		})
 	}
 
-	return c.processTextChannel(ctx, channelProcessParams{
+	return c.processTextChannel(ctx, &channelProcessParams{
 		channelID:  channelID,
 		owner:      owner,
 		repo:       repo,
@@ -433,100 +432,100 @@ func (c *Coordinator) processChannel(
 }
 
 type channelProcessParams struct {
+	checkResp  *CheckResponse
+	threadInfo state.ThreadInfo
 	channelID  string
 	owner      string
 	repo       string
-	number     int
 	params     format.ChannelMessageParams
-	checkResp  *CheckResponse
-	threadInfo state.ThreadInfo
+	number     int
 	exists     bool
 }
 
-func (c *Coordinator) processForumChannel(ctx context.Context, p channelProcessParams) error {
-	title := format.ForumThreadTitle(p.params.Repo, p.params.Number, p.params.Title)
-	content := format.ChannelMessage(p.params)
+func (c *Coordinator) processForumChannel(ctx context.Context, params *channelProcessParams) error {
+	title := format.ForumThreadTitle(params.params.Repo, params.params.Number, params.params.Title)
+	content := format.ChannelMessage(params.params)
 
-	if p.exists && p.threadInfo.ThreadID != "" {
+	if params.exists && params.threadInfo.ThreadID != "" {
 		// Content comparison: skip update if content unchanged
-		if p.threadInfo.MessageText == content {
+		if params.threadInfo.MessageText == content {
 			c.logger.Debug("forum post unchanged, skipping update",
-				"thread_id", p.threadInfo.ThreadID,
-				"pr", p.params.PRURL)
-			c.trackTaggedUsers(p.params)
+				"thread_id", params.threadInfo.ThreadID,
+				"pr", params.params.PRURL)
+			c.trackTaggedUsers(params.params)
 			return nil
 		}
 
 		// Update existing thread
-		err := c.discord.UpdateForumPost(ctx, p.threadInfo.ThreadID, p.threadInfo.MessageID, title, content)
+		err := c.discord.UpdateForumPost(ctx, params.threadInfo.ThreadID, params.threadInfo.MessageID, title, content)
 		if err == nil {
 			// Update state
-			p.threadInfo.MessageText = content
-			p.threadInfo.LastState = string(p.params.State)
-			if err := c.store.SaveThread(ctx, p.owner, p.repo, p.number, p.channelID, p.threadInfo); err != nil {
+			params.threadInfo.MessageText = content
+			params.threadInfo.LastState = string(params.params.State)
+			if err := c.store.SaveThread(ctx, params.owner, params.repo, params.number, params.channelID, params.threadInfo); err != nil {
 				c.logger.Warn("failed to save thread info", "error", err)
 			}
 
 			// Archive if merged/closed
-			if p.params.State == format.StateMerged || p.params.State == format.StateClosed {
-				if err := c.discord.ArchiveThread(ctx, p.threadInfo.ThreadID); err != nil {
+			if params.params.State == format.StateMerged || params.params.State == format.StateClosed {
+				if err := c.discord.ArchiveThread(ctx, params.threadInfo.ThreadID); err != nil {
 					c.logger.Warn("failed to archive thread", "error", err)
 				}
 			}
 
-			c.trackTaggedUsers(p.params)
+			c.trackTaggedUsers(params.params)
 			return nil
 		}
 		c.logger.Warn("failed to update forum post, will search/create", "error", err)
 	}
 
 	// Thread doesn't exist - check if we should create it based on "when" threshold
-	when := c.config.When(p.owner, p.params.ChannelName)
+	when := c.config.When(params.owner, params.params.ChannelName)
 	if when != "immediate" {
-		shouldPost, reason := c.shouldPostThread(p.checkResp, when)
+		shouldPost, reason := c.shouldPostThread(params.checkResp, when)
 
 		if !shouldPost {
 			c.logger.Debug("not creating forum thread - threshold not met",
-				"pr", p.params.PRURL,
-				"channel", p.params.ChannelName,
+				"pr", params.params.PRURL,
+				"channel", params.params.ChannelName,
 				"when", when,
 				"reason", reason)
 			return nil // Don't create thread yet - next event will check again
 		}
 
 		c.logger.Info("creating forum thread - threshold met",
-			"pr", p.params.PRURL,
-			"channel", p.params.ChannelName,
+			"pr", params.params.PRURL,
+			"channel", params.params.ChannelName,
 			"when", when,
 			"reason", reason)
 	}
 
 	// Try to claim this thread creation
 	const claimTTL = 10 * time.Second
-	if !c.store.ClaimThread(ctx, p.owner, p.repo, p.number, p.channelID, claimTTL) {
+	if !c.store.ClaimThread(ctx, params.owner, params.repo, params.number, params.channelID, claimTTL) {
 		// Another instance claimed it, search for their thread
 		c.logger.Info("another instance claimed forum thread, searching for their thread",
-			"pr", p.params.PRURL)
+			"pr", params.params.PRURL)
 
 		// Wait briefly for the other instance to post
 		time.Sleep(crossInstanceRaceDelay * 2)
 
 		// Search for existing thread created by the other instance
-		if foundThreadID, foundMsgID, found := c.discord.FindForumThread(ctx, p.channelID, p.params.PRURL); found {
+		if foundThreadID, foundMsgID, found := c.discord.FindForumThread(ctx, params.channelID, params.params.PRURL); found {
 			c.logger.Info("found forum thread created by another instance",
 				"thread_id", foundThreadID,
-				"pr", p.params.PRURL)
+				"pr", params.params.PRURL)
 
 			// Save the found thread and update it
 			newInfo := state.ThreadInfo{
 				ThreadID:    foundThreadID,
 				MessageID:   foundMsgID,
-				ChannelID:   p.channelID,
+				ChannelID:   params.channelID,
 				ChannelType: "forum",
-				LastState:   string(p.params.State),
+				LastState:   string(params.params.State),
 				MessageText: content,
 			}
-			if err := c.store.SaveThread(ctx, p.owner, p.repo, p.number, p.channelID, newInfo); err != nil {
+			if err := c.store.SaveThread(ctx, params.owner, params.repo, params.number, params.channelID, newInfo); err != nil {
 				c.logger.Warn("failed to save found thread info", "error", err)
 			}
 
@@ -535,33 +534,33 @@ func (c *Coordinator) processForumChannel(ctx context.Context, p channelProcessP
 				c.logger.Warn("failed to update found forum post", "error", err)
 			}
 
-			c.trackTaggedUsers(p.params)
+			c.trackTaggedUsers(params.params)
 			return nil
 		}
 
 		c.logger.Warn("another instance claimed forum thread but not found, proceeding to create",
-			"pr", p.params.PRURL)
+			"pr", params.params.PRURL)
 	}
 
 	// We claimed it - brief delay then search once more before creating
 	time.Sleep(crossInstanceRaceDelay)
 
 	// Search for existing thread (in case claim race occurred)
-	if foundThreadID, foundMsgID, found := c.discord.FindForumThread(ctx, p.channelID, p.params.PRURL); found {
+	if foundThreadID, foundMsgID, found := c.discord.FindForumThread(ctx, params.channelID, params.params.PRURL); found {
 		c.logger.Info("found existing forum thread from search",
 			"thread_id", foundThreadID,
-			"pr", p.params.PRURL)
+			"pr", params.params.PRURL)
 
 		// Save the found thread and update it
 		newInfo := state.ThreadInfo{
 			ThreadID:    foundThreadID,
 			MessageID:   foundMsgID,
-			ChannelID:   p.channelID,
+			ChannelID:   params.channelID,
 			ChannelType: "forum",
-			LastState:   string(p.params.State),
+			LastState:   string(params.params.State),
 			MessageText: content,
 		}
-		if err := c.store.SaveThread(ctx, p.owner, p.repo, p.number, p.channelID, newInfo); err != nil {
+		if err := c.store.SaveThread(ctx, params.owner, params.repo, params.number, params.channelID, newInfo); err != nil {
 			c.logger.Warn("failed to save found thread info", "error", err)
 		}
 
@@ -570,12 +569,12 @@ func (c *Coordinator) processForumChannel(ctx context.Context, p channelProcessP
 			c.logger.Warn("failed to update found forum post", "error", err)
 		}
 
-		c.trackTaggedUsers(p.params)
+		c.trackTaggedUsers(params.params)
 		return nil
 	}
 
 	// Create new forum thread
-	threadID, messageID, err := c.discord.PostForumThread(ctx, p.channelID, title, content)
+	threadID, messageID, err := c.discord.PostForumThread(ctx, params.channelID, title, content)
 	if err != nil {
 		return fmt.Errorf("create forum thread: %w", err)
 	}
@@ -584,163 +583,163 @@ func (c *Coordinator) processForumChannel(ctx context.Context, p channelProcessP
 	newInfo := state.ThreadInfo{
 		ThreadID:    threadID,
 		MessageID:   messageID,
-		ChannelID:   p.channelID,
+		ChannelID:   params.channelID,
 		ChannelType: "forum",
-		LastState:   string(p.params.State),
+		LastState:   string(params.params.State),
 		MessageText: content,
 	}
-	if err := c.store.SaveThread(ctx, p.owner, p.repo, p.number, p.channelID, newInfo); err != nil {
+	if err := c.store.SaveThread(ctx, params.owner, params.repo, params.number, params.channelID, newInfo); err != nil {
 		c.logger.Warn("failed to save thread info", "error", err)
 	}
 
-	c.trackTaggedUsers(p.params)
+	c.trackTaggedUsers(params.params)
 	return nil
 }
 
-func (c *Coordinator) processTextChannel(ctx context.Context, p channelProcessParams) error {
-	content := format.ChannelMessage(p.params)
+func (c *Coordinator) processTextChannel(ctx context.Context, params *channelProcessParams) error {
+	content := format.ChannelMessage(params.params)
 
-	if p.exists && p.threadInfo.MessageID != "" {
+	if params.exists && params.threadInfo.MessageID != "" {
 		c.logger.Info("found thread in cache",
-			"message_id", p.threadInfo.MessageID,
-			"channel_id", p.channelID,
-			"pr", p.params.PRURL,
-			"last_state", p.threadInfo.LastState)
+			"message_id", params.threadInfo.MessageID,
+			"channel_id", params.channelID,
+			"pr", params.params.PRURL,
+			"last_state", params.threadInfo.LastState)
 
 		// Content comparison: skip update if content unchanged
-		if p.threadInfo.MessageText == content {
+		if params.threadInfo.MessageText == content {
 			c.logger.Info("channel message unchanged, skipping update",
-				"message_id", p.threadInfo.MessageID,
-				"pr", p.params.PRURL)
-			c.trackTaggedUsers(p.params)
+				"message_id", params.threadInfo.MessageID,
+				"pr", params.params.PRURL)
+			c.trackTaggedUsers(params.params)
 			return nil
 		}
 
 		// Update existing message
-		err := c.discord.UpdateMessage(ctx, p.channelID, p.threadInfo.MessageID, content)
+		err := c.discord.UpdateMessage(ctx, params.channelID, params.threadInfo.MessageID, content)
 		if err == nil {
-			p.threadInfo.MessageText = content
-			p.threadInfo.LastState = string(p.params.State)
-			if err := c.store.SaveThread(ctx, p.owner, p.repo, p.number, p.channelID, p.threadInfo); err != nil {
+			params.threadInfo.MessageText = content
+			params.threadInfo.LastState = string(params.params.State)
+			if err := c.store.SaveThread(ctx, params.owner, params.repo, params.number, params.channelID, params.threadInfo); err != nil {
 				c.logger.Warn("failed to save thread info", "error", err)
 			}
 
-			c.trackTaggedUsers(p.params)
+			c.trackTaggedUsers(params.params)
 			return nil
 		}
 		c.logger.Warn("failed to update message, will search/create", "error", err)
 	} else {
 		c.logger.Info("thread not found in cache, will search channel history",
-			"channel_id", p.channelID,
-			"pr", p.params.PRURL,
-			"exists", p.exists,
-			"has_message_id", p.exists && p.threadInfo.MessageID != "")
+			"channel_id", params.channelID,
+			"pr", params.params.PRURL,
+			"exists", params.exists,
+			"has_message_id", params.exists && params.threadInfo.MessageID != "")
 	}
 
 	// Message doesn't exist - check if we should create it based on "when" threshold
-	when := c.config.When(p.owner, p.params.ChannelName)
+	when := c.config.When(params.owner, params.params.ChannelName)
 	if when != "immediate" {
-		shouldPost, reason := c.shouldPostThread(p.checkResp, when)
+		shouldPost, reason := c.shouldPostThread(params.checkResp, when)
 
 		if !shouldPost {
 			c.logger.Debug("not creating channel message - threshold not met",
-				"pr", p.params.PRURL,
-				"channel", p.params.ChannelName,
+				"pr", params.params.PRURL,
+				"channel", params.params.ChannelName,
 				"when", when,
 				"reason", reason)
 			return nil // Don't create message yet - next event will check again
 		}
 
 		c.logger.Info("creating channel message - threshold met",
-			"pr", p.params.PRURL,
-			"channel", p.params.ChannelName,
+			"pr", params.params.PRURL,
+			"channel", params.params.ChannelName,
 			"when", when,
 			"reason", reason)
 	}
 
 	// Try to claim this thread creation
 	const claimTTL = 10 * time.Second
-	if !c.store.ClaimThread(ctx, p.owner, p.repo, p.number, p.channelID, claimTTL) {
+	if !c.store.ClaimThread(ctx, params.owner, params.repo, params.number, params.channelID, claimTTL) {
 		// Another instance claimed it, search for their message
 		c.logger.Info("another instance claimed thread, searching for their message",
-			"pr", p.params.PRURL)
+			"pr", params.params.PRURL)
 
 		// Wait briefly for the other instance to post
 		time.Sleep(crossInstanceRaceDelay * 2)
 
 		// Search for existing message created by the other instance
-		if foundMsgID, found := c.discord.FindChannelMessage(ctx, p.channelID, p.params.PRURL); found {
+		if foundMsgID, found := c.discord.FindChannelMessage(ctx, params.channelID, params.params.PRURL); found {
 			c.logger.Info("found message created by another instance",
 				"message_id", foundMsgID,
-				"pr", p.params.PRURL)
+				"pr", params.params.PRURL)
 
 			// Check if content needs updating
-			currentContent, err := c.discord.MessageContent(ctx, p.channelID, foundMsgID)
+			currentContent, err := c.discord.MessageContent(ctx, params.channelID, foundMsgID)
 			if err == nil && currentContent == content {
 				c.logger.Info("found message content unchanged, skipping update",
 					"message_id", foundMsgID,
-					"pr", p.params.PRURL)
-			} else if err := c.discord.UpdateMessage(ctx, p.channelID, foundMsgID, content); err != nil {
+					"pr", params.params.PRURL)
+			} else if err := c.discord.UpdateMessage(ctx, params.channelID, foundMsgID, content); err != nil {
 				c.logger.Warn("failed to update found message", "error", err)
 			}
 
 			// Save thread info to cache
 			newInfo := state.ThreadInfo{
 				MessageID:   foundMsgID,
-				ChannelID:   p.channelID,
+				ChannelID:   params.channelID,
 				ChannelType: "text",
-				LastState:   string(p.params.State),
+				LastState:   string(params.params.State),
 				MessageText: content,
 			}
-			if err := c.store.SaveThread(ctx, p.owner, p.repo, p.number, p.channelID, newInfo); err != nil {
+			if err := c.store.SaveThread(ctx, params.owner, params.repo, params.number, params.channelID, newInfo); err != nil {
 				c.logger.Warn("failed to save found message info", "error", err)
 			}
 
-			c.trackTaggedUsers(p.params)
+			c.trackTaggedUsers(params.params)
 			return nil
 		}
 
 		c.logger.Warn("another instance claimed but message not found, proceeding to create",
-			"pr", p.params.PRURL)
+			"pr", params.params.PRURL)
 	}
 
 	// We claimed it - brief delay then search once more before creating
 	time.Sleep(crossInstanceRaceDelay)
 
 	// Search for existing message (in case claim race occurred)
-	if foundMsgID, found := c.discord.FindChannelMessage(ctx, p.channelID, p.params.PRURL); found {
+	if foundMsgID, found := c.discord.FindChannelMessage(ctx, params.channelID, params.params.PRURL); found {
 		c.logger.Info("found existing channel message from search",
 			"message_id", foundMsgID,
-			"pr", p.params.PRURL)
+			"pr", params.params.PRURL)
 
 		// Check if content actually changed before updating
-		currentContent, err := c.discord.MessageContent(ctx, p.channelID, foundMsgID)
+		currentContent, err := c.discord.MessageContent(ctx, params.channelID, foundMsgID)
 		if err == nil && currentContent == content {
 			c.logger.Info("found message content unchanged, skipping update",
 				"message_id", foundMsgID,
-				"pr", p.params.PRURL)
-		} else if err := c.discord.UpdateMessage(ctx, p.channelID, foundMsgID, content); err != nil {
+				"pr", params.params.PRURL)
+		} else if err := c.discord.UpdateMessage(ctx, params.channelID, foundMsgID, content); err != nil {
 			c.logger.Warn("failed to update found message", "error", err)
 		}
 
 		// Save thread info to cache
 		newInfo := state.ThreadInfo{
 			MessageID:   foundMsgID,
-			ChannelID:   p.channelID,
+			ChannelID:   params.channelID,
 			ChannelType: "text",
-			LastState:   string(p.params.State),
+			LastState:   string(params.params.State),
 			MessageText: content,
 		}
-		if err := c.store.SaveThread(ctx, p.owner, p.repo, p.number, p.channelID, newInfo); err != nil {
+		if err := c.store.SaveThread(ctx, params.owner, params.repo, params.number, params.channelID, newInfo); err != nil {
 			c.logger.Warn("failed to save found message info", "error", err)
 		}
 
-		c.trackTaggedUsers(p.params)
+		c.trackTaggedUsers(params.params)
 		return nil
 	}
 
 	// Create new message
-	messageID, err := c.discord.PostMessage(ctx, p.channelID, content)
+	messageID, err := c.discord.PostMessage(ctx, params.channelID, content)
 	if err != nil {
 		return fmt.Errorf("post message: %w", err)
 	}
@@ -748,16 +747,16 @@ func (c *Coordinator) processTextChannel(ctx context.Context, p channelProcessPa
 	// Save message info
 	newInfo := state.ThreadInfo{
 		MessageID:   messageID,
-		ChannelID:   p.channelID,
+		ChannelID:   params.channelID,
 		ChannelType: "text",
-		LastState:   string(p.params.State),
+		LastState:   string(params.params.State),
 		MessageText: content,
 	}
-	if err := c.store.SaveThread(ctx, p.owner, p.repo, p.number, p.channelID, newInfo); err != nil {
+	if err := c.store.SaveThread(ctx, params.owner, params.repo, params.number, params.channelID, newInfo); err != nil {
 		c.logger.Warn("failed to save thread info", "error", err)
 	}
 
-	c.trackTaggedUsers(p.params)
+	c.trackTaggedUsers(params.params)
 	return nil
 }
 
@@ -802,54 +801,70 @@ func (c *Coordinator) queueDMNotifications(
 }
 
 type dmProcessParams struct {
+	checkResp  *CheckResponse
 	owner      string
 	repo       string
-	number     int
-	checkResp  *CheckResponse
 	prState    format.PRState
 	prURL      string
 	username   string
 	actionKind string
+	number     int
+}
+
+// discordIDForUser returns the Discord ID for a GitHub username.
+func (c *Coordinator) discordIDForUser(ctx context.Context, username string) string {
+	var discordID string
+	if c.UserMapper != nil {
+		discordID = c.UserMapper.DiscordID(ctx, username)
+	}
+	if discordID == "" {
+		c.logger.Debug("skipping DM - no Discord mapping",
+			"github_user", username)
+	}
+	return discordID
+}
+
+// shouldSkipDM returns true if the DM should be skipped for this user.
+func (c *Coordinator) shouldSkipDM(ctx context.Context, discordID, username string) bool {
+	if !c.discord.IsUserInGuild(ctx, discordID) {
+		c.logger.Debug("skipping DM - user not in guild",
+			"github_user", username,
+			"discord_id", discordID)
+		return true
+	}
+	return false
 }
 
 // processDMForUser handles DM notification for a single user.
 // Uses per-user-PR locking to prevent duplicate DMs.
-func (c *Coordinator) processDMForUser(ctx context.Context, p dmProcessParams) {
-	// Get Discord ID
-	var discordID string
-	if c.userMapper != nil {
-		discordID = c.userMapper.DiscordID(ctx, p.username)
-	}
+//
+//nolint:maintidx // Complexity inherent to DM deduplication across multiple instances
+func (c *Coordinator) processDMForUser(ctx context.Context, params dmProcessParams) {
+	discordID := c.discordIDForUser(ctx, params.username)
 	if discordID == "" {
-		c.logger.Debug("skipping DM - no Discord mapping",
-			"github_user", p.username)
 		return
 	}
 
 	// Lock per user+PR to prevent concurrent duplicate DMs
-	dmLock := c.dmLock(discordID, p.prURL)
+	dmLock := c.dmLocks.get(discordID + ":" + params.prURL)
 	dmLock.Lock()
 	defer dmLock.Unlock()
 
-	// Check if user is in guild
-	if !c.discord.IsUserInGuild(ctx, discordID) {
-		c.logger.Debug("skipping DM - user not in guild",
-			"github_user", p.username,
-			"discord_id", discordID)
+	if c.shouldSkipDM(ctx, discordID, params.username) {
 		return
 	}
 
 	// Build DM message
-	params := format.ChannelMessageParams{
-		Owner:  p.owner,
-		Repo:   p.repo,
-		Number: p.number,
-		Title:  p.checkResp.PullRequest.Title,
-		Author: p.checkResp.PullRequest.Author,
-		State:  p.prState,
-		PRURL:  p.prURL,
+	msgParams := format.ChannelMessageParams{
+		Owner:  params.owner,
+		Repo:   params.repo,
+		Number: params.number,
+		Title:  params.checkResp.PullRequest.Title,
+		Author: params.checkResp.PullRequest.Author,
+		State:  params.prState,
+		PRURL:  params.prURL,
 	}
-	newMessage := format.DMMessage(params, format.ActionLabel(p.actionKind))
+	newMessage := format.DMMessage(msgParams, format.ActionLabel(params.actionKind))
 
 	// Check for existing queued DMs for this user+PR
 	pendingDMs, err := c.store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
@@ -858,7 +873,7 @@ func (c *Coordinator) processDMForUser(ctx context.Context, p dmProcessParams) {
 	}
 	var existingPending *state.PendingDM
 	for _, dm := range pendingDMs {
-		if dm.UserID == discordID && dm.PRURL == p.prURL {
+		if dm.UserID == discordID && dm.PRURL == params.prURL {
 			existingPending = dm
 			break
 		}
@@ -869,8 +884,8 @@ func (c *Coordinator) processDMForUser(ctx context.Context, p dmProcessParams) {
 		if existingPending.MessageText == newMessage {
 			// State unchanged, keep existing queued DM
 			c.logger.Debug("DM already queued with same state",
-				"user", p.username,
-				"pr_url", p.prURL)
+				"user", params.username,
+				"pr_url", params.prURL)
 			return
 		}
 		// State changed - remove old queued DM and queue new one
@@ -878,19 +893,19 @@ func (c *Coordinator) processDMForUser(ctx context.Context, p dmProcessParams) {
 			c.logger.Warn("failed to remove old pending DM", "error", err)
 		}
 		c.logger.Debug("updating queued DM with new state",
-			"user", p.username,
-			"pr_url", p.prURL)
+			"user", params.username,
+			"pr_url", params.prURL)
 	}
 
 	// Check for existing sent DM in store
-	dmInfo, dmExists := c.store.DMInfo(ctx, discordID, p.prURL)
+	dmInfo, dmExists := c.store.DMInfo(ctx, discordID, params.prURL)
 
 	// If no stored DM info, search DM history as fallback (handles restarts)
 	if !dmExists {
-		if foundChannelID, foundMsgID, found := c.discord.FindDMForPR(ctx, discordID, p.prURL); found {
+		if foundChannelID, foundMsgID, found := c.discord.FindDMForPR(ctx, discordID, params.prURL); found {
 			c.logger.Info("found existing DM in history",
 				"user_id", discordID,
-				"pr_url", p.prURL)
+				"pr_url", params.prURL)
 			dmInfo = state.DMInfo{
 				ChannelID: foundChannelID,
 				MessageID: foundMsgID,
@@ -901,11 +916,11 @@ func (c *Coordinator) processDMForUser(ctx context.Context, p dmProcessParams) {
 	}
 
 	// Idempotency: skip if state unchanged
-	if dmExists && dmInfo.LastState == string(p.prState) {
+	if dmExists && dmInfo.LastState == string(params.prState) {
 		c.logger.Info("DM skipped - state unchanged",
-			"user", p.username,
-			"pr_url", p.prURL,
-			"state", p.prState)
+			"user", params.username,
+			"pr_url", params.prURL,
+			"state", params.prState)
 		return
 	}
 
@@ -914,8 +929,8 @@ func (c *Coordinator) processDMForUser(ctx context.Context, p dmProcessParams) {
 		// Content comparison: skip if message unchanged
 		if dmInfo.MessageText == newMessage {
 			c.logger.Info("DM content unchanged, skipping update",
-				"user", p.username,
-				"pr_url", p.prURL)
+				"user", params.username,
+				"pr_url", params.prURL)
 			return
 		}
 
@@ -923,51 +938,51 @@ func (c *Coordinator) processDMForUser(ctx context.Context, p dmProcessParams) {
 		if err == nil {
 			// Save updated DM info
 			dmInfo.MessageText = newMessage
-			dmInfo.LastState = string(p.prState)
+			dmInfo.LastState = string(params.prState)
 			dmInfo.SentAt = time.Now()
-			if err := c.store.SaveDMInfo(ctx, discordID, p.prURL, dmInfo); err != nil {
+			if err := c.store.SaveDMInfo(ctx, discordID, params.prURL, dmInfo); err != nil {
 				c.logger.Warn("failed to save updated DM info", "error", err)
 			}
 			c.logger.Info("updated DM notification",
 				"user_id", discordID,
-				"github_user", p.username,
-				"pr_url", p.prURL,
-				"state", p.prState)
+				"github_user", params.username,
+				"pr_url", params.prURL,
+				"state", params.prState)
 			return
 		}
 		c.logger.Warn("failed to update DM",
 			"error", err,
 			"user_id", discordID,
-			"pr_url", p.prURL)
+			"pr_url", params.prURL)
 		// Fall through to potentially queue new DM
 	}
 
 	// New DM - try to claim it to prevent duplicate DMs from multiple instances
 	const dmClaimTTL = 10 * time.Second
-	if !c.store.ClaimDM(ctx, discordID, p.prURL, dmClaimTTL) {
+	if !c.store.ClaimDM(ctx, discordID, params.prURL, dmClaimTTL) {
 		// Another instance claimed this DM, search for it
 		c.logger.Debug("another instance claimed DM, searching for their message",
-			"user", p.username,
-			"pr_url", p.prURL)
+			"user", params.username,
+			"pr_url", params.prURL)
 
 		// Brief wait for other instance to create/queue DM
 		time.Sleep(200 * time.Millisecond)
 
 		// Check if DM was created by other instance
-		if foundChannelID, foundMsgID, found := c.discord.FindDMForPR(ctx, discordID, p.prURL); found {
+		if foundChannelID, foundMsgID, found := c.discord.FindDMForPR(ctx, discordID, params.prURL); found {
 			c.logger.Info("found DM created by another instance",
 				"user_id", discordID,
-				"pr_url", p.prURL)
+				"pr_url", params.prURL)
 
 			// Save the found DM info
 			dmInfo = state.DMInfo{
 				ChannelID:   foundChannelID,
 				MessageID:   foundMsgID,
 				MessageText: newMessage,
-				LastState:   string(p.prState),
+				LastState:   string(params.prState),
 				SentAt:      time.Now(),
 			}
-			if err := c.store.SaveDMInfo(ctx, discordID, p.prURL, dmInfo); err != nil {
+			if err := c.store.SaveDMInfo(ctx, discordID, params.prURL, dmInfo); err != nil {
 				c.logger.Warn("failed to save found DM info", "error", err)
 			}
 			return
@@ -977,22 +992,22 @@ func (c *Coordinator) processDMForUser(ctx context.Context, p dmProcessParams) {
 		pendingDMs, err := c.store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
 		if err == nil {
 			for _, pendingDM := range pendingDMs {
-				if pendingDM.UserID == discordID && pendingDM.PRURL == p.prURL {
+				if pendingDM.UserID == discordID && pendingDM.PRURL == params.prURL {
 					c.logger.Debug("DM already queued by another instance",
-						"user", p.username,
-						"pr_url", p.prURL)
+						"user", params.username,
+						"pr_url", params.prURL)
 					return
 				}
 			}
 		}
 
 		c.logger.Warn("another instance claimed DM but not found, proceeding to queue",
-			"user", p.username,
-			"pr_url", p.prURL)
+			"user", params.username,
+			"pr_url", params.prURL)
 	}
 
 	// Check delay configuration
-	channels := c.config.ChannelsForRepo(c.org, p.repo)
+	channels := c.config.ChannelsForRepo(c.org, params.repo)
 	delay := 65 // default
 	if len(channels) > 0 {
 		delay = c.config.ReminderDMDelay(c.org, channels[0])
@@ -1000,14 +1015,14 @@ func (c *Coordinator) processDMForUser(ctx context.Context, p dmProcessParams) {
 
 	if delay == 0 {
 		c.logger.Debug("skipping DM - notifications disabled",
-			"github_user", p.username,
-			"repo", p.repo)
+			"github_user", params.username,
+			"repo", params.repo)
 		return
 	}
 
 	// Calculate send time
 	sendAt := time.Now()
-	if c.tagTracker.wasTagged(p.prURL, p.username) {
+	if c.tagTracker.wasTagged(params.prURL, params.username) {
 		// User was tagged in channel, delay DM
 		sendAt = sendAt.Add(time.Duration(delay) * time.Minute)
 	}
@@ -1017,7 +1032,7 @@ func (c *Coordinator) processDMForUser(ctx context.Context, p dmProcessParams) {
 	dm := &state.PendingDM{
 		ID:          uuid.New().String(),
 		UserID:      discordID,
-		PRURL:       p.prURL,
+		PRURL:       params.prURL,
 		MessageText: newMessage,
 		SendAt:      sendAt,
 		CreatedAt:   now,
@@ -1030,11 +1045,11 @@ func (c *Coordinator) processDMForUser(ctx context.Context, p dmProcessParams) {
 	if err := c.store.QueuePendingDM(ctx, dm); err != nil {
 		c.logger.Warn("failed to queue DM",
 			"error", err,
-			"user", p.username)
+			"user", params.username)
 		return
 	}
 	c.logger.Debug("queued DM notification",
-		"user", p.username,
+		"user", params.username,
 		"discord_id", discordID,
 		"send_at", sendAt)
 }
@@ -1088,7 +1103,7 @@ func (c *Coordinator) updateAllDMsForClosedPR(
 
 // updateDMForClosedPR updates a single user's DM for a closed PR.
 func (c *Coordinator) updateDMForClosedPR(ctx context.Context, discordID, prURL string, prState format.PRState, msg string) {
-	lock := c.dmLock(discordID, prURL)
+	lock := c.dmLocks.get(discordID + ":" + prURL)
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -1153,16 +1168,6 @@ func (c *Coordinator) Wait() {
 	c.wg.Wait()
 }
 
-// prLock returns a mutex for serializing operations on a specific PR.
-func (c *Coordinator) prLock(url string) *sync.Mutex {
-	return c.prLocks.get(url)
-}
-
-// dmLock returns a mutex for serializing DM operations for a specific user+PR.
-func (c *Coordinator) dmLock(userID, prURL string) *sync.Mutex {
-	return c.dmLocks.get(userID + ":" + prURL)
-}
-
 // CleanupLocks removes idle locks to prevent unbounded memory growth.
 // Should be called periodically from the main event loop.
 func (c *Coordinator) CleanupLocks() {
@@ -1173,15 +1178,6 @@ func (c *Coordinator) CleanupLocks() {
 			"pr_locks_removed", prRemoved,
 			"dm_locks_removed", dmRemoved)
 	}
-}
-
-// ExportUserMapperCache returns the cached user mappings (githubUsername -> discordID).
-// Returns empty map if the user mapper doesn't support cache export.
-func (c *Coordinator) ExportUserMapperCache() map[string]string {
-	if mapper, ok := c.userMapper.(*usermapping.Mapper); ok {
-		return mapper.ExportCache()
-	}
-	return make(map[string]string)
 }
 
 // tagTracker tracks which users were tagged in channel messages.
@@ -1379,8 +1375,8 @@ func (c *Coordinator) checkUserDailyReport(
 ) {
 	// Get Discord ID for this GitHub user
 	discordID := ""
-	if c.userMapper != nil {
-		discordID = c.userMapper.DiscordID(ctx, githubUsername)
+	if c.UserMapper != nil {
+		discordID = c.UserMapper.DiscordID(ctx, githubUsername)
 	}
 	if discordID == "" {
 		c.logger.Debug("skipping daily report - no Discord mapping",

@@ -285,11 +285,11 @@ func runCoordinators(
 	}
 }
 
-func (cm *coordinatorManager) startCoordinators(ctx context.Context) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+func (m *coordinatorManager) startCoordinators(ctx context.Context) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	orgs := cm.githubManager.AllOrgs()
+	orgs := m.githubManager.AllOrgs()
 	slog.Info("checking GitHub installations", "total_orgs", len(orgs))
 
 	// Track current orgs
@@ -299,43 +299,43 @@ func (cm *coordinatorManager) startCoordinators(ctx context.Context) {
 	}
 
 	// Stop coordinators for removed orgs
-	for org, cancel := range cm.active {
+	for org, cancel := range m.active {
 		if !currentOrgs[org] {
 			slog.Info("stopping coordinator for removed org", "org", org)
 			cancel()
-			delete(cm.active, org)
+			delete(m.active, org)
 		}
 	}
 
 	// Start coordinators for new orgs
 	for _, org := range orgs {
-		cm.startSingleCoordinator(ctx, org)
+		m.startSingleCoordinator(ctx, org)
 	}
 }
 
-func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org string) bool {
+func (m *coordinatorManager) startSingleCoordinator(ctx context.Context, org string) bool {
 	// Skip if already running
-	if _, exists := cm.active[org]; exists {
+	if _, exists := m.active[org]; exists {
 		return true
 	}
 
 	// Get GitHub client for this org
-	ghClient, exists := cm.githubManager.ClientForOrg(org)
+	ghClient, exists := m.githubManager.ClientForOrg(org)
 	if !exists {
 		slog.Warn("no GitHub client for org", "org", org)
 		return false
 	}
 
 	// Set GitHub client in config manager
-	cm.configManager.SetGitHubClient(org, ghClient.Client())
+	m.configManager.SetGitHubClient(org, ghClient.Client())
 
 	// Try to load discord.yaml config
-	if err := cm.configManager.LoadConfig(ctx, org); err != nil {
+	if err := m.configManager.LoadConfig(ctx, org); err != nil {
 		slog.Debug("failed to load config for org (may not have discord.yaml)", "org", org, "error", err)
 		return false
 	}
 
-	cfg, exists := cm.configManager.Config(org)
+	cfg, exists := m.configManager.Config(org)
 	if !exists || cfg.Global.GuildID == "" {
 		slog.Debug("skipping org without Discord configuration", "org", org)
 		return false
@@ -344,34 +344,34 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 	guildID := cfg.Global.GuildID
 
 	// Get or create Discord client for this guild
-	discordClient, err := cm.discordClientForGuild(ctx, guildID)
+	discordClient, err := m.discordClientForGuild(ctx, guildID)
 	if err != nil {
 		slog.Error("failed to get Discord client",
 			"org", org,
 			"guild_id", guildID,
 			"error", err)
-		cm.failed[org] = time.Now()
+		m.failed[org] = time.Now()
 		return false
 	}
 
 	// Register with notification manager
-	cm.notifyMgr.RegisterGuild(guildID, discordClient)
+	m.notifyMgr.RegisterGuild(guildID, discordClient)
 
 	// Create user mapper
-	userMapper := usermapping.New(org, cm.configManager, discordClient)
+	userMapper := usermapping.New(org, m.configManager, discordClient)
 
 	// Create Turn client with token provider (will fetch fresh tokens automatically)
-	turnClient := bot.NewTurnClient(cm.cfg.TurnURL, ghClient)
+	turnClient := bot.NewTurnClient(m.cfg.TurnURL, ghClient)
 
 	// Create PR searcher for polling backup
-	searcher := github.NewSearcher(cm.githubManager.AppClient(), slog.Default())
+	searcher := github.NewSearcher(m.githubManager.AppClient(), slog.Default())
 
 	// Create coordinator
 	coordinator := bot.NewCoordinator(bot.CoordinatorConfig{
 		Org:        org,
 		Discord:    discordClient,
-		Config:     cm.configManager,
-		Store:      cm.store,
+		Config:     m.configManager,
+		Store:      m.store,
 		Turn:       turnClient,
 		UserMapper: userMapper,
 		Searcher:   searcher,
@@ -380,9 +380,9 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 
 	// Start coordinator in goroutine
 	orgCtx, cancel := context.WithCancel(ctx)
-	cm.active[org] = cancel
-	cm.coordinators[org] = coordinator
-	delete(cm.failed, org)
+	m.active[org] = cancel
+	m.coordinators[org] = coordinator
+	delete(m.failed, org)
 
 	go func(org string, coord *bot.Coordinator, sprinklerURL string, tokenProvider bot.TokenProvider) {
 		slog.Info("starting coordinator",
@@ -398,9 +398,9 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 			OnEvent: func(event bot.SprinklerEvent) {
 				coord.ProcessEvent(orgCtx, event)
 				// Track last event time
-				cm.mu.Lock()
-				cm.lastEventTime[org] = time.Now()
-				cm.mu.Unlock()
+				m.mu.Lock()
+				m.lastEventTime[org] = time.Now()
+				m.mu.Unlock()
 			},
 			OnConnect: func() {
 				slog.Info("connected to sprinkler", "org", org)
@@ -412,7 +412,7 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 		})
 		if err != nil {
 			slog.Error("failed to create sprinkler client", "org", org, "error", err)
-			cm.handleCoordinatorExit(org, err)
+			m.handleCoordinatorExit(org, err)
 			return
 		}
 
@@ -443,22 +443,22 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 			case <-cleanupTicker.C:
 				coord.CleanupLocks()
 			case err := <-sprinklerDone:
-				cm.handleCoordinatorExit(org, err)
+				m.handleCoordinatorExit(org, err)
 				return
 			}
 		}
-	}(org, coordinator, cm.cfg.SprinklerURL, ghClient)
+	}(org, coordinator, m.cfg.SprinklerURL, ghClient)
 
 	return true
 }
 
-func (cm *coordinatorManager) discordClientForGuild(_ context.Context, guildID string) (*discord.Client, error) {
-	// Check if client already exists (caller must hold cm.mu lock)
-	if client, exists := cm.discordClients[guildID]; exists {
+func (m *coordinatorManager) discordClientForGuild(_ context.Context, guildID string) (*discord.Client, error) {
+	// Check if client already exists (caller must hold m.mu lock)
+	if client, exists := m.discordClients[guildID]; exists {
 		return client, nil
 	}
 
-	client, err := discord.New(cm.cfg.DiscordBotToken)
+	client, err := discord.New(m.cfg.DiscordBotToken)
 	if err != nil {
 		return nil, fmt.Errorf("create Discord client: %w", err)
 	}
@@ -470,18 +470,18 @@ func (cm *coordinatorManager) discordClientForGuild(_ context.Context, guildID s
 	}
 
 	// Register with guild manager
-	cm.guildManager.RegisterClient(guildID, client)
+	m.guildManager.RegisterClient(guildID, client)
 
 	// Set up slash command handler
 	slashHandler := discord.NewSlashCommandHandler(client.Session(), slog.Default())
 	slashHandler.SetupHandler()
 
 	// Set status, report, usermap, and channel map getters
-	slashHandler.SetStatusGetter(cm)
-	slashHandler.SetReportGetter(cm)
-	slashHandler.SetUserMapGetter(cm)
-	slashHandler.SetChannelMapGetter(cm)
-	slashHandler.SetDailyReportGetter(cm)
+	slashHandler.SetStatusGetter(m)
+	slashHandler.SetReportGetter(m)
+	slashHandler.SetUserMapGetter(m)
+	slashHandler.SetChannelMapGetter(m)
+	slashHandler.SetDailyReportGetter(m)
 
 	// Register slash commands with Discord
 	if err := slashHandler.RegisterCommands(guildID); err != nil {
@@ -491,41 +491,41 @@ func (cm *coordinatorManager) discordClientForGuild(_ context.Context, guildID s
 		// Don't fail - continue without slash commands
 	}
 
-	cm.discordClients[guildID] = client
-	cm.slashHandlers[guildID] = slashHandler
+	m.discordClients[guildID] = client
+	m.slashHandlers[guildID] = slashHandler
 	slog.Info("created Discord client for guild", "guild_id", guildID)
 
 	return client, nil
 }
 
-func (cm *coordinatorManager) handleCoordinatorExit(org string, err error) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+func (m *coordinatorManager) handleCoordinatorExit(org string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	if err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("coordinator exited with error", "org", org, "error", err)
-		cm.failed[org] = time.Now()
+		m.failed[org] = time.Now()
 	} else {
 		slog.Info("coordinator stopped", "org", org)
 	}
 
-	delete(cm.active, org)
-	delete(cm.coordinators, org)
+	delete(m.active, org)
+	delete(m.coordinators, org)
 }
 
-func (cm *coordinatorManager) shutdown() error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+func (m *coordinatorManager) shutdown() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	slog.Info("stopping all coordinators", "count", len(cm.active))
+	slog.Info("stopping all coordinators", "count", len(m.active))
 
-	for org, cancel := range cm.active {
+	for org, cancel := range m.active {
 		slog.Info("stopping coordinator", "org", org)
 		cancel()
 	}
 
 	// Close Discord clients
-	for guildID, client := range cm.discordClients {
+	for guildID, client := range m.discordClients {
 		if err := client.Close(); err != nil {
 			slog.Warn("failed to close Discord client", "guild_id", guildID, "error", err)
 		}
@@ -536,43 +536,45 @@ func (cm *coordinatorManager) shutdown() error {
 }
 
 // Status implements discord.StatusGetter interface.
-func (cm *coordinatorManager) Status(ctx context.Context, guildID string) discord.BotStatus {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+func (m *coordinatorManager) Status(ctx context.Context, guildID string) discord.BotStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	status := discord.BotStatus{
-		Connected:            len(cm.active) > 0,
-		ConnectedOrgs:        make([]string, 0, len(cm.active)),
-		UptimeSeconds:        int64(time.Since(cm.startTime).Seconds()),
-		SprinklerConnections: len(cm.active), // Each active org has a sprinkler connection
-		DMsSent:              cm.dmsSent,
-		DailyReportsSent:     cm.dailyReports,
-		ChannelMessagesSent:  cm.channelMsgs,
+		Connected:            len(m.active) > 0,
+		ConnectedOrgs:        make([]string, 0, len(m.active)),
+		UptimeSeconds:        int64(time.Since(m.startTime).Seconds()),
+		SprinklerConnections: len(m.active), // Each active org has a sprinkler connection
+		DMsSent:              m.dmsSent,
+		DailyReportsSent:     m.dailyReports,
+		ChannelMessagesSent:  m.channelMsgs,
 	}
 
 	// Find all orgs for this guild (a guild may monitor multiple orgs)
 	var orgsForGuild []string
-	for org := range cm.active {
+	for org := range m.active {
 		status.ConnectedOrgs = append(status.ConnectedOrgs, org)
 
-		cfg, exists := cm.configManager.Config(org)
+		cfg, exists := m.configManager.Config(org)
 		if exists && cfg.Global.GuildID == guildID {
 			orgsForGuild = append(orgsForGuild, org)
 		}
 	}
 
 	// Count cached users from both forward and reverse mappers
-	if cm.reverseMapper != nil {
-		status.UsersCached = len(cm.reverseMapper.ExportCache())
+	if m.reverseMapper != nil {
+		status.UsersCached = len(m.reverseMapper.ExportCache())
 	}
 	for _, org := range orgsForGuild {
-		if coord, exists := cm.coordinators[org]; exists {
-			status.UsersCached += len(coord.ExportUserMapperCache())
+		if coord, exists := m.coordinators[org]; exists {
+			if mapper, ok := coord.UserMapper.(*usermapping.Mapper); ok {
+				status.UsersCached += len(mapper.ExportCache())
+			}
 		}
 	}
 
 	// Get pending DMs count
-	pendingDMs, err := cm.store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
+	pendingDMs, err := m.store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
 	if err == nil {
 		status.PendingDMs = len(pendingDMs)
 	}
@@ -581,14 +583,14 @@ func (cm *coordinatorManager) Status(ctx context.Context, guildID string) discor
 	var lastEventTime time.Time
 	for _, org := range orgsForGuild {
 		// Track most recent event across all orgs
-		if lastEvent, exists := cm.lastEventTime[org]; exists {
+		if lastEvent, exists := m.lastEventTime[org]; exists {
 			if lastEvent.After(lastEventTime) {
 				lastEventTime = lastEvent
 			}
 		}
 
 		// Collect channels and repos from all orgs
-		if cfg, exists := cm.configManager.Config(org); exists {
+		if cfg, exists := m.configManager.Config(org); exists {
 			for channelName, channelConfig := range cfg.Channels {
 				status.WatchedChannels = append(status.WatchedChannels, channelName)
 				status.ConfiguredRepos = append(status.ConfiguredRepos, channelConfig.Repos...)
@@ -604,20 +606,20 @@ func (cm *coordinatorManager) Status(ctx context.Context, guildID string) discor
 }
 
 // Report implements discord.ReportGetter interface.
-func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string) (*discord.PRReport, error) {
+func (m *coordinatorManager) Report(ctx context.Context, guildID, userID string) (*discord.PRReport, error) {
 	slog.Info("report requested",
 		"guild_id", guildID,
 		"user_id", userID)
 
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	// Find all orgs for this guild (a guild may monitor multiple orgs)
 	var orgsForGuild []string
 	var allOrgs []string
-	for org := range cm.active {
+	for org := range m.active {
 		allOrgs = append(allOrgs, org)
-		cfg, exists := cm.configManager.Config(org)
+		cfg, exists := m.configManager.Config(org)
 		if exists && cfg.Global.GuildID == guildID {
 			orgsForGuild = append(orgsForGuild, org)
 		}
@@ -634,7 +636,7 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 			"guild_id", guildID,
 			"user_id", userID,
 			"active_orgs", allOrgs,
-			"active_org_count", len(cm.active))
+			"active_org_count", len(m.active))
 		return nil, fmt.Errorf("no org found for guild %s", guildID)
 	}
 
@@ -647,11 +649,16 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 	// First try forward mapper caches (these contain discovered/cached mappings)
 	var githubUsername string
 	for _, org := range orgsForGuild {
-		coord, exists := cm.coordinators[org]
+		coord, exists := m.coordinators[org]
 		if !exists {
 			continue
 		}
-		forwardCache := coord.ExportUserMapperCache()
+		var forwardCache map[string]string
+		if mapper, ok := coord.UserMapper.(*usermapping.Mapper); ok {
+			forwardCache = mapper.ExportCache()
+		} else {
+			forwardCache = make(map[string]string)
+		}
 		slog.Debug("checking forward mapper cache for reverse lookup",
 			"org", org,
 			"discord_user_id", userID,
@@ -675,7 +682,7 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 	if githubUsername == "" {
 		slog.Debug("GitHub username not found in forward mapper caches, trying reverse mapper",
 			"discord_user_id", userID)
-		githubUsername = cm.reverseMapper.GitHubUsername(ctx, userID, &configAdapter{cm.configManager}, orgsForGuild)
+		githubUsername = m.reverseMapper.GitHubUsername(ctx, userID, &configAdapter{m.configManager}, orgsForGuild)
 	}
 
 	if githubUsername == "" {
@@ -696,7 +703,7 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 	var incomingPRs []discord.PRSummary
 	var outgoingPRs []discord.PRSummary
 
-	searcher := github.NewSearcher(cm.githubManager.AppClient(), slog.Default())
+	searcher := github.NewSearcher(m.githubManager.AppClient(), slog.Default())
 
 	for _, org := range orgsForGuild {
 		slog.Info("searching PRs for org",
@@ -705,7 +712,7 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 			"guild_id", guildID)
 
 		// Get GitHub client for this org
-		client, exists := cm.githubManager.ClientForOrg(org)
+		client, exists := m.githubManager.ClientForOrg(org)
 		if !exists {
 			slog.Warn("no GitHub client for org, skipping",
 				"org", org,
@@ -715,7 +722,7 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 		}
 
 		// Create Turn client for this org
-		turn := bot.NewTurnClient(cm.cfg.TurnURL, client)
+		turn := bot.NewTurnClient(m.cfg.TurnURL, client)
 
 		// Search for PRs authored by this user (outgoing)
 		slog.Info("searching authored PRs",
@@ -775,19 +782,19 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 }
 
 // DailyReport implements discord.DailyReportGetter interface.
-func (cm *coordinatorManager) DailyReport(ctx context.Context, guildID, userID string, force bool) (*discord.DailyReportDebug, error) {
+func (m *coordinatorManager) DailyReport(ctx context.Context, guildID, userID string, force bool) (*discord.DailyReportDebug, error) {
 	slog.Info("daily report requested",
 		"guild_id", guildID,
 		"user_id", userID,
 		"force", force)
 
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	// Find orgs for this guild
 	var orgsForGuild []string
-	for org := range cm.active {
-		cfg, exists := cm.configManager.Config(org)
+	for org := range m.active {
+		cfg, exists := m.configManager.Config(org)
 		if exists && cfg.Global.GuildID == guildID {
 			orgsForGuild = append(orgsForGuild, org)
 		}
@@ -800,11 +807,16 @@ func (cm *coordinatorManager) DailyReport(ctx context.Context, guildID, userID s
 	// Find GitHub username
 	var githubUsername string
 	for _, org := range orgsForGuild {
-		coord, exists := cm.coordinators[org]
+		coord, exists := m.coordinators[org]
 		if !exists {
 			continue
 		}
-		forwardCache := coord.ExportUserMapperCache()
+		var forwardCache map[string]string
+		if mapper, ok := coord.UserMapper.(*usermapping.Mapper); ok {
+			forwardCache = mapper.ExportCache()
+		} else {
+			forwardCache = make(map[string]string)
+		}
 		for ghUser, discordID := range forwardCache {
 			if discordID == userID {
 				githubUsername = ghUser
@@ -818,7 +830,7 @@ func (cm *coordinatorManager) DailyReport(ctx context.Context, guildID, userID s
 
 	// Try reverse mapper if not found
 	if githubUsername == "" {
-		githubUsername = cm.reverseMapper.GitHubUsername(ctx, userID, &configAdapter{cm.configManager}, orgsForGuild)
+		githubUsername = m.reverseMapper.GitHubUsername(ctx, userID, &configAdapter{m.configManager}, orgsForGuild)
 	}
 
 	if githubUsername == "" {
@@ -826,7 +838,7 @@ func (cm *coordinatorManager) DailyReport(ctx context.Context, guildID, userID s
 	}
 
 	// Get Discord client for this guild
-	discordClient, exists := cm.discordClients[guildID]
+	discordClient, exists := m.discordClients[guildID]
 	if !exists {
 		return nil, fmt.Errorf("no Discord client for guild %s", guildID)
 	}
@@ -835,7 +847,7 @@ func (cm *coordinatorManager) DailyReport(ctx context.Context, guildID, userID s
 	isOnline := discordClient.IsUserActive(ctx, userID)
 
 	// Get daily report state
-	reportInfo, _ := cm.store.DailyReportInfo(ctx, userID)
+	reportInfo, _ := m.store.DailyReportInfo(ctx, userID)
 	now := time.Now()
 
 	// Calculate timing info
@@ -850,15 +862,15 @@ func (cm *coordinatorManager) DailyReport(ctx context.Context, guildID, userID s
 	var incomingPRs []discord.PRSummary
 	var outgoingPRs []discord.PRSummary
 
-	searcher := github.NewSearcher(cm.githubManager.AppClient(), slog.Default())
+	searcher := github.NewSearcher(m.githubManager.AppClient(), slog.Default())
 
 	for _, org := range orgsForGuild {
-		client, exists := cm.githubManager.ClientForOrg(org)
+		client, exists := m.githubManager.ClientForOrg(org)
 		if !exists {
 			continue
 		}
 
-		turn := bot.NewTurnClient(cm.cfg.TurnURL, client)
+		turn := bot.NewTurnClient(m.cfg.TurnURL, client)
 
 		// Search authored PRs
 		authored, err := searcher.ListAuthoredPRs(ctx, org, githubUsername)
@@ -906,7 +918,7 @@ func (cm *coordinatorManager) DailyReport(ctx context.Context, guildID, userID s
 	// Send report if forced or eligible
 	if force || eligible {
 		// Create daily report sender
-		sender := dailyreport.NewSender(cm.store, slog.Default())
+		sender := dailyreport.NewSender(m.store, slog.Default())
 
 		// Register guild DM sender
 		sender.RegisterGuild(guildID, discordClient)
@@ -929,7 +941,7 @@ func (cm *coordinatorManager) DailyReport(ctx context.Context, guildID, userID s
 		} else {
 			reportSent = true
 			reason = "Report sent successfully"
-			cm.dailyReports++
+			m.dailyReports++
 		}
 	}
 
@@ -949,17 +961,17 @@ func (cm *coordinatorManager) DailyReport(ctx context.Context, guildID, userID s
 }
 
 // UserMappings implements discord.UserMapGetter interface.
-func (cm *coordinatorManager) UserMappings(ctx context.Context, guildID string) (*discord.UserMappings, error) {
+func (m *coordinatorManager) UserMappings(ctx context.Context, guildID string) (*discord.UserMappings, error) {
 	slog.Info("user mappings requested",
 		"guild_id", guildID)
 
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	// Find all orgs for this guild
 	var orgsForGuild []string
-	for org := range cm.active {
-		cfg, exists := cm.configManager.Config(org)
+	for org := range m.active {
+		cfg, exists := m.configManager.Config(org)
 		if exists && cfg.Global.GuildID == guildID {
 			orgsForGuild = append(orgsForGuild, org)
 		}
@@ -981,7 +993,7 @@ func (cm *coordinatorManager) UserMappings(ctx context.Context, guildID string) 
 
 	// Collect config mappings from each org
 	for _, org := range orgsForGuild {
-		cfg, exists := cm.configManager.Config(org)
+		cfg, exists := m.configManager.Config(org)
 		if !exists {
 			continue
 		}
@@ -1012,7 +1024,7 @@ func (cm *coordinatorManager) UserMappings(ctx context.Context, guildID string) 
 	}
 
 	// Collect cached mappings from reverse mapper (Discord -> GitHub)
-	reverseCache := cm.reverseMapper.ExportCache()
+	reverseCache := m.reverseMapper.ExportCache()
 	for discordID, githubUsername := range reverseCache {
 		// Check if this is already in config mappings
 		found := false
@@ -1034,13 +1046,18 @@ func (cm *coordinatorManager) UserMappings(ctx context.Context, guildID string) 
 
 	// Collect cached mappings from each org's forward mapper (GitHub -> Discord)
 	for _, org := range orgsForGuild {
-		coord, exists := cm.coordinators[org]
+		coord, exists := m.coordinators[org]
 		if !exists {
 			continue
 		}
 
 		// Get cached forward mappings
-		forwardCache := coord.ExportUserMapperCache()
+		var forwardCache map[string]string
+		if mapper, ok := coord.UserMapper.(*usermapping.Mapper); ok {
+			forwardCache = mapper.ExportCache()
+		} else {
+			forwardCache = make(map[string]string)
+		}
 		slog.Debug("collecting forward mapper cache",
 			"org", org,
 			"cached_user_count", len(forwardCache))
@@ -1092,17 +1109,17 @@ func (cm *coordinatorManager) UserMappings(ctx context.Context, guildID string) 
 }
 
 // ChannelMappings implements discord.ChannelMapGetter interface.
-func (cm *coordinatorManager) ChannelMappings(ctx context.Context, guildID string) (*discord.ChannelMappings, error) {
+func (m *coordinatorManager) ChannelMappings(ctx context.Context, guildID string) (*discord.ChannelMappings, error) {
 	slog.Info("channel mappings requested",
 		"guild_id", guildID)
 
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	// Find all orgs for this guild
 	var orgsForGuild []string
-	for org := range cm.active {
-		cfg, exists := cm.configManager.Config(org)
+	for org := range m.active {
+		cfg, exists := m.configManager.Config(org)
 		if exists && cfg.Global.GuildID == guildID {
 			orgsForGuild = append(orgsForGuild, org)
 		}
@@ -1123,7 +1140,7 @@ func (cm *coordinatorManager) ChannelMappings(ctx context.Context, guildID strin
 
 	// Collect channel mappings from each org's config
 	for _, org := range orgsForGuild {
-		cfg, exists := cm.configManager.Config(org)
+		cfg, exists := m.configManager.Config(org)
 		if !exists {
 			continue
 		}
@@ -1133,7 +1150,7 @@ func (cm *coordinatorManager) ChannelMappings(ctx context.Context, guildID strin
 		repoChannelTypes := make(map[string][]string)
 
 		for channelName, channelConfig := range cfg.Channels {
-			channelType := cm.configManager.ChannelType(org, channelName)
+			channelType := m.configManager.ChannelType(org, channelName)
 			for _, repo := range channelConfig.Repos {
 				fullRepo := fmt.Sprintf("%s/%s", org, repo)
 				repoChannels[fullRepo] = append(repoChannels[fullRepo], channelName)
@@ -1285,14 +1302,27 @@ func loadConfig(ctx context.Context) (config.ServerConfig, error) {
 		}
 	}
 
+	sprinklerURL := os.Getenv("SPRINKLER_URL")
+	if sprinklerURL == "" {
+		sprinklerURL = "wss://webhook.github.codegroove.app/ws"
+	}
+	turnURL := os.Getenv("TURN_URL")
+	if turnURL == "" {
+		turnURL = "https://turn.github.codegroove.app"
+	}
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "9119"
+	}
+
 	cfg := config.ServerConfig{
 		GitHubAppID:           os.Getenv("GITHUB_APP_ID"),
 		GitHubPrivateKey:      githubPrivateKey,
-		SprinklerURL:          getEnv("SPRINKLER_URL", "wss://webhook.github.codegroove.app/ws"),
-		TurnURL:               getEnv("TURN_URL", "https://turn.github.codegroove.app"),
+		SprinklerURL:          sprinklerURL,
+		TurnURL:               turnURL,
 		DiscordBotToken:       getSecret("DISCORD_BOT_TOKEN"),
 		GCPProject:            os.Getenv("GCP_PROJECT"),
-		Port:                  getEnv("PORT", "9119"),
+		Port:                  port,
 		AllowPersonalAccounts: os.Getenv("ALLOW_PERSONAL_ACCOUNTS") == "true",
 	}
 
@@ -1308,13 +1338,6 @@ func loadConfig(ctx context.Context) (config.ServerConfig, error) {
 	}
 
 	return cfg, nil
-}
-
-func getEnv(key, defaultValue string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return defaultValue
 }
 
 func healthHandler(w http.ResponseWriter, _ *http.Request) {

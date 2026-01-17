@@ -47,6 +47,8 @@ type DailyReportInfo struct {
 }
 
 // Store provides persistent state operations.
+//
+//nolint:interfacebloat // Store handles threads, DMs, events, reports, and cleanup
 type Store interface {
 	// Thread/post tracking - maps PR to Discord thread/message
 	Thread(ctx context.Context, owner, repo string, number int, channelID string) (ThreadInfo, bool)

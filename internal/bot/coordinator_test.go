@@ -1108,8 +1108,8 @@ func TestCoordinator_CleanupLocks(t *testing.T) {
 	})
 
 	// Create some locks by getting them
-	prLock := coord.prLock("https://github.com/testorg/repo/pull/1")
-	dmLock := coord.dmLock("user123", "https://github.com/testorg/repo/pull/1")
+	prLock := coord.prLocks.get("https://github.com/testorg/repo/pull/1")
+	dmLock := coord.dmLocks.get("user123:https://github.com/testorg/repo/pull/1")
 
 	// Locks exist
 	if prLock == nil {
@@ -1123,16 +1123,16 @@ func TestCoordinator_CleanupLocks(t *testing.T) {
 	coord.CleanupLocks()
 
 	// Locks should still exist (same mutex returned)
-	if coord.prLock("https://github.com/testorg/repo/pull/1") != prLock {
+	if coord.prLocks.get("https://github.com/testorg/repo/pull/1") != prLock {
 		t.Error("PR lock should still be the same mutex")
 	}
-	if coord.dmLock("user123", "https://github.com/testorg/repo/pull/1") != dmLock {
+	if coord.dmLocks.get("user123:https://github.com/testorg/repo/pull/1") != dmLock {
 		t.Error("DM lock should still be the same mutex")
 	}
 }
 
-// TestCoordinator_ExportUserMapperCache tests the ExportUserMapperCache method.
-func TestCoordinator_ExportUserMapperCache(t *testing.T) {
+// TestCoordinator_UserMapperField tests that UserMapper field is exported and accessible.
+func TestCoordinator_UserMapperField(t *testing.T) {
 	discord := newMockDiscordClient()
 	store := state.NewMemoryStore()
 	turn := newMockTurnClient()
@@ -1147,12 +1147,8 @@ func TestCoordinator_ExportUserMapperCache(t *testing.T) {
 			Config:  cfgMgr,
 		})
 
-		cache := coord.ExportUserMapperCache()
-		if cache == nil {
-			t.Error("should return empty map, not nil")
-		}
-		if len(cache) != 0 {
-			t.Errorf("cache should be empty, got %d entries", len(cache))
+		if coord.UserMapper != nil {
+			t.Error("UserMapper should be nil when not provided")
 		}
 	})
 
@@ -1168,10 +1164,8 @@ func TestCoordinator_ExportUserMapperCache(t *testing.T) {
 			UserMapper: mapper,
 		})
 
-		cache := coord.ExportUserMapperCache()
-		// Mock mapper doesn't implement Mapper interface, so should return empty map
-		if len(cache) != 0 {
-			t.Errorf("cache should be empty for non-Mapper type, got %d entries", len(cache))
+		if coord.UserMapper != mapper {
+			t.Error("UserMapper should be the provided mapper instance")
 		}
 	})
 }
@@ -4011,7 +4005,7 @@ func TestCoordinator_processTextChannel_ClaimFailedFindMessage(t *testing.T) {
 	}
 
 	// Should find the message from other instance
-	err := coord.processTextChannel(ctx, channelProcessParams{
+	err := coord.processTextChannel(ctx, &channelProcessParams{
 		channelID:  channelID,
 		owner:      "owner",
 		repo:       "repo",
@@ -4077,7 +4071,7 @@ func TestCoordinator_processTextChannel_ClaimSucceededSearchFindsSameContent(t *
 	}
 
 	// Should find existing message and skip creation
-	err := coord.processTextChannel(ctx, channelProcessParams{
+	err := coord.processTextChannel(ctx, &channelProcessParams{
 		channelID:  channelID,
 		owner:      "owner",
 		repo:       "repo",
@@ -4161,7 +4155,7 @@ func TestCoordinator_processTextChannel_UpdateFailsFallsThrough(t *testing.T) {
 	}
 
 	// Should try to update cached message, fail, then search and find the message
-	err := coord.processTextChannel(ctx, channelProcessParams{
+	err := coord.processTextChannel(ctx, &channelProcessParams{
 		channelID:  channelID,
 		owner:      "owner",
 		repo:       "repo",
@@ -4411,7 +4405,7 @@ func TestCoordinator_processForumChannel_Archive(t *testing.T) {
 	}
 
 	// Process forum channel with merged PR
-	err := coord.processForumChannel(ctx, channelProcessParams{
+	err := coord.processForumChannel(ctx, &channelProcessParams{
 		channelID:  channelID,
 		owner:      "owner",
 		repo:       "repo",
@@ -4479,7 +4473,7 @@ func TestCoordinator_processForumChannel_ClaimFailed(t *testing.T) {
 	}
 
 	// Process forum channel
-	err := coord.processForumChannel(ctx, channelProcessParams{
+	err := coord.processForumChannel(ctx, &channelProcessParams{
 		channelID:  channelID,
 		owner:      "owner",
 		repo:       "repo",
@@ -4547,7 +4541,7 @@ func TestCoordinator_processForumChannel_WhenThreshold(t *testing.T) {
 	}
 
 	// Process forum channel - should not create thread yet
-	err := coord.processForumChannel(ctx, channelProcessParams{
+	err := coord.processForumChannel(ctx, &channelProcessParams{
 		channelID:  channelID,
 		owner:      "testorg",
 		repo:       "repo",

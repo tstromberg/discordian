@@ -113,17 +113,37 @@ func TestNewSearcher(t *testing.T) {
 }
 
 // TestSearchPRs tests the searchPRs function with a mock GitHub API server.
+// Helper function to create a GitHub client pointing to a test server
+func setupTestGitHubClient(t *testing.T, serverURL string) *github.Client {
+	t.Helper()
+	client := github.NewClient(nil)
+	parsedURL, err := client.BaseURL.Parse(serverURL + "/")
+	if err != nil {
+		t.Fatalf("Failed to parse URL: %v", err)
+	}
+	client.BaseURL = parsedURL
+	return client
+}
+
+// Helper function to encode and write JSON response
+func writeJSONResponse(t *testing.T, w http.ResponseWriter, response any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		t.Errorf("Failed to encode response: %v", err)
+	}
+}
+
+//nolint:maintidx // Test complexity from multiple subtests with mock servers
 func TestSearchPRs(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("successful search with results", func(t *testing.T) {
-		// Create a mock GitHub API server
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/search/issues" {
 				t.Errorf("Expected path /search/issues, got %s", r.URL.Path)
 			}
 
-			// Return mock search results
 			response := &github.IssuesSearchResult{
 				Total: github.Int(2),
 				Issues: []*github.Issue{
@@ -146,20 +166,11 @@ func TestSearchPRs(t *testing.T) {
 				},
 			}
 
-			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(response); err != nil {
-				t.Errorf("Failed to encode response: %v", err)
-			}
+			writeJSONResponse(t, w, response)
 		}))
 		defer server.Close()
 
-		// Create a GitHub client pointing to the mock server
-		client := github.NewClient(nil)
-		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
-		if err != nil {
-			t.Fatalf("Failed to parse URL: %v", err)
-		}
-		client.BaseURL = parsedURL
+		client := setupTestGitHubClient(t, server.URL)
 
 		searcher := NewSearcher(&AppClient{}, nil)
 		results, err := searcher.searchPRs(ctx, client, "test query")
@@ -186,31 +197,21 @@ func TestSearchPRs(t *testing.T) {
 
 	t.Run("search with no pull requests", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Return issues that are not PRs
 			response := &github.IssuesSearchResult{
 				Total: github.Int(1),
 				Issues: []*github.Issue{
 					{
 						Number:           github.Int(789),
 						RepositoryURL:    github.String("https://api.github.com/repos/testowner/testrepo"),
-						PullRequestLinks: nil, // Not a PR
+						PullRequestLinks: nil,
 					},
 				},
 			}
-
-			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(response); err != nil {
-				t.Errorf("Failed to encode response: %v", err)
-			}
+			writeJSONResponse(t, w, response)
 		}))
 		defer server.Close()
 
-		client := github.NewClient(nil)
-		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
-		if err != nil {
-			t.Fatalf("Failed to parse URL: %v", err)
-		}
-		client.BaseURL = parsedURL
+		client := setupTestGitHubClient(t, server.URL)
 
 		searcher := NewSearcher(&AppClient{}, nil)
 		results, err := searcher.searchPRs(ctx, client, "test query")
@@ -230,25 +231,16 @@ func TestSearchPRs(t *testing.T) {
 				Issues: []*github.Issue{
 					{
 						Number:           github.Int(123),
-						RepositoryURL:    nil, // Missing repo URL
+						RepositoryURL:    nil,
 						PullRequestLinks: &github.PullRequestLinks{HTMLURL: github.String("url")},
 					},
 				},
 			}
-
-			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(response); err != nil {
-				t.Errorf("Failed to encode response: %v", err)
-			}
+			writeJSONResponse(t, w, response)
 		}))
 		defer server.Close()
 
-		client := github.NewClient(nil)
-		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
-		if err != nil {
-			t.Fatalf("Failed to parse URL: %v", err)
-		}
-		client.BaseURL = parsedURL
+		client := setupTestGitHubClient(t, server.URL)
 
 		searcher := NewSearcher(&AppClient{}, nil)
 		results, err := searcher.searchPRs(ctx, client, "test query")
@@ -271,25 +263,16 @@ func TestSearchPRs(t *testing.T) {
 						RepositoryURL: github.String("https://api.github.com/repos/testowner/testrepo"),
 						UpdatedAt:     &github.Timestamp{Time: time.Now()},
 						PullRequestLinks: &github.PullRequestLinks{
-							HTMLURL: nil, // Empty HTML URL
+							HTMLURL: nil,
 						},
 					},
 				},
 			}
-
-			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(response); err != nil {
-				t.Errorf("Failed to encode response: %v", err)
-			}
+			writeJSONResponse(t, w, response)
 		}))
 		defer server.Close()
 
-		client := github.NewClient(nil)
-		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
-		if err != nil {
-			t.Fatalf("Failed to parse URL: %v", err)
-		}
-		client.BaseURL = parsedURL
+		client := setupTestGitHubClient(t, server.URL)
 
 		searcher := NewSearcher(&AppClient{}, nil)
 		results, err := searcher.searchPRs(ctx, client, "test query")
@@ -316,15 +299,10 @@ func TestSearchPRs(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := github.NewClient(nil)
-		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
-		if err != nil {
-			t.Fatalf("Failed to parse URL: %v", err)
-		}
-		client.BaseURL = parsedURL
+		client := setupTestGitHubClient(t, server.URL)
 
 		searcher := NewSearcher(&AppClient{}, nil)
-		_, err = searcher.searchPRs(ctx, client, "test query")
+		_, err := searcher.searchPRs(ctx, client, "test query")
 
 		if err == nil {
 			t.Error("searchPRs() error = nil, want error")
@@ -338,7 +316,6 @@ func TestSearchPRs(t *testing.T) {
 
 			var response *github.IssuesSearchResult
 			if pageCount == 1 {
-				// First page
 				response = &github.IssuesSearchResult{
 					Total: github.Int(3),
 					Issues: []*github.Issue{
@@ -352,10 +329,8 @@ func TestSearchPRs(t *testing.T) {
 						},
 					},
 				}
-				// Indicate there's a next page
 				w.Header().Set("Link", `<`+r.URL.String()+`&page=2>; rel="next"`)
 			} else {
-				// Second page
 				response = &github.IssuesSearchResult{
 					Total: github.Int(3),
 					Issues: []*github.Issue{
@@ -371,19 +346,11 @@ func TestSearchPRs(t *testing.T) {
 				}
 			}
 
-			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(response); err != nil {
-				t.Errorf("Failed to encode response: %v", err)
-			}
+			writeJSONResponse(t, w, response)
 		}))
 		defer server.Close()
 
-		client := github.NewClient(nil)
-		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
-		if err != nil {
-			t.Fatalf("Failed to parse URL: %v", err)
-		}
-		client.BaseURL = parsedURL
+		client := setupTestGitHubClient(t, server.URL)
 
 		searcher := NewSearcher(&AppClient{}, nil)
 		results, err := searcher.searchPRs(ctx, client, "test query")

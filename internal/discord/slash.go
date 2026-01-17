@@ -1,3 +1,4 @@
+//nolint:revive // Package defines slash commands and all related types (14 public types)
 package discord
 
 import (
@@ -289,15 +290,15 @@ func (h *SlashCommandHandler) handleGooseCommand(
 	}
 }
 
-func (h *SlashCommandHandler) handleStatusCommand(session *discordgo.Session, i *discordgo.InteractionCreate) {
+func (h *SlashCommandHandler) handleStatusCommand(session *discordgo.Session, interaction *discordgo.InteractionCreate) {
 	// Context is created here because this is a callback from discordgo library
 	// which doesn't provide context in its handler signature
 	ctx := context.Background()
-	guildID := i.GuildID
+	guildID := interaction.GuildID
 
 	h.logger.Info("handling status command",
 		"guild_id", guildID,
-		"user_id", i.Member.User.ID)
+		"user_id", interaction.Member.User.ID)
 
 	var status BotStatus
 	if h.statusGetter != nil {
@@ -375,7 +376,7 @@ func (h *SlashCommandHandler) handleStatusCommand(session *discordgo.Session, i 
 		embed.Description = fmt.Sprintf("**Organizations:** %s", orgsStr)
 	}
 
-	h.respond(session, i, embed)
+	h.respond(session, interaction, embed)
 }
 
 // formatDuration formats a duration in a human-readable way.

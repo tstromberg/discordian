@@ -425,7 +425,7 @@ func (c *Coordinator) processForumChannel(
 	exists bool,
 ) error {
 	title := format.ForumThreadTitle(params.Repo, params.Number, params.Title)
-	content := format.ForumThreadContent(params)
+	content := format.ChannelMessage(params)
 
 	if exists && threadInfo.ThreadID != "" {
 		// Content comparison: skip update if content unchanged

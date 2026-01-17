@@ -636,9 +636,9 @@ func TestDiscordConfig_GetUsers(t *testing.T) {
 		},
 	}
 
-	users := cfg.GetUsers()
+	users := cfg.UserMappings()
 	if len(users) != 2 {
-		t.Errorf("GetUsers() returned %d users, want 2", len(users))
+		t.Errorf("Users() returned %d users, want 2", len(users))
 	}
 	if users["alice"] != "111111111111111111" {
 		t.Errorf("users[alice] = %q, want 111111111111111111", users["alice"])

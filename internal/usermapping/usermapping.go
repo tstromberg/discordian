@@ -73,7 +73,8 @@ func (m *Mapper) DiscordID(ctx context.Context, githubUsername string) string {
 	if m.configLookup != nil {
 		if configValue := m.configLookup.DiscordUserID(m.org, githubUsername); configValue != "" {
 			// Check if config value is a numeric ID or a Discord username
-			if isNumericID(configValue) {
+			// Discord IDs are 17-20 digit snowflakes
+			if len(configValue) >= 17 && len(configValue) <= 20 && isAllDigits(configValue) {
 				// It's a numeric ID, use it directly
 				m.cacheResult(githubUsername, configValue)
 				slog.Info("mapped GitHub user to Discord via config (numeric ID)",
@@ -142,10 +143,9 @@ func (m *Mapper) cacheResult(githubUsername, discordID string) {
 	}
 }
 
-// isNumericID returns true if the string looks like a Discord numeric ID.
-// Discord IDs are 17-19 digit snowflakes.
-func isNumericID(s string) bool {
-	if len(s) < 17 || len(s) > 20 {
+// isAllDigits returns true if the string is non-empty and contains only digit characters.
+func isAllDigits(s string) bool {
+	if len(s) == 0 {
 		return false
 	}
 	for _, r := range s {

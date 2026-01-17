@@ -389,7 +389,7 @@ type mockOrgConfig struct {
 	users map[string]string
 }
 
-func (m *mockOrgConfig) GetUsers() map[string]string {
+func (m *mockOrgConfig) UserMappings() map[string]string {
 	return m.users
 }
 

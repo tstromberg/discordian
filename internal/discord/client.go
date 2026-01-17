@@ -46,9 +46,9 @@ func retryableCtx(ctx context.Context, fn func() error) error {
 	return retry.Do(
 		fn,
 		retry.Context(ctx),
-		retry.Attempts(3),
-		retry.Delay(500*time.Millisecond),
-		retry.MaxDelay(5*time.Second),
+		retry.Attempts(5),
+		retry.Delay(time.Second),
+		retry.MaxDelay(2*time.Minute),
 		retry.DelayType(retry.BackOffDelay),
 		retry.LastErrorOnly(true),
 		retry.RetryIf(func(err error) bool {
@@ -103,9 +103,14 @@ func (c *Client) Session() *discordgo.Session {
 
 // PostMessage sends a plain text message to a channel with link embeds suppressed.
 func (c *Client) PostMessage(ctx context.Context, channelID, text string) (string, error) {
-	msg, err := c.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
-		Content: text,
-		Flags:   discordgo.MessageFlagsSuppressEmbeds,
+	var msg *discordgo.Message
+	err := retryableCtx(ctx, func() error {
+		var err error
+		msg, err = c.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+			Content: text,
+			Flags:   discordgo.MessageFlagsSuppressEmbeds,
+		})
+		return err
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to send message: %w", err)
@@ -121,11 +126,14 @@ func (c *Client) PostMessage(ctx context.Context, channelID, text string) (strin
 
 // UpdateMessage edits an existing message.
 func (c *Client) UpdateMessage(ctx context.Context, channelID, messageID, newText string) error {
-	_, err := c.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
-		ID:      messageID,
-		Channel: channelID,
-		Content: &newText,
-		Flags:   discordgo.MessageFlagsSuppressEmbeds,
+	err := retryableCtx(ctx, func() error {
+		_, err := c.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
+			ID:      messageID,
+			Channel: channelID,
+			Content: &newText,
+			Flags:   discordgo.MessageFlagsSuppressEmbeds,
+		})
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("failed to edit message: %w", err)
@@ -141,11 +149,16 @@ func (c *Client) UpdateMessage(ctx context.Context, channelID, messageID, newTex
 
 // PostForumThread creates a forum post with title and content, with link embeds suppressed.
 func (c *Client) PostForumThread(ctx context.Context, channelID, title, content string) (threadID, messageID string, err error) {
-	thread, err := c.session.ForumThreadStartComplex(channelID, &discordgo.ThreadStart{
-		Name: format.Truncate(title, 100), // Discord limits thread names
-	}, &discordgo.MessageSend{
-		Content: content,
-		Flags:   discordgo.MessageFlagsSuppressEmbeds,
+	var thread *discordgo.Channel
+	err = retryableCtx(ctx, func() error {
+		var err error
+		thread, err = c.session.ForumThreadStartComplex(channelID, &discordgo.ThreadStart{
+			Name: format.Truncate(title, 100), // Discord limits thread names
+		}, &discordgo.MessageSend{
+			Content: content,
+			Flags:   discordgo.MessageFlagsSuppressEmbeds,
+		})
+		return err
 	})
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create forum thread: %w", err)
@@ -163,7 +176,12 @@ func (c *Client) PostForumThread(ctx context.Context, channelID, title, content 
 		"content", content)
 
 	// Get the first message in the thread to return its ID
-	messages, err := c.session.ChannelMessages(thread.ID, 1, "", "", "")
+	var messages []*discordgo.Message
+	err = retryableCtx(ctx, func() error {
+		var err error
+		messages, err = c.session.ChannelMessages(thread.ID, 1, "", "", "")
+		return err
+	})
 	if err == nil && len(messages) > 0 {
 		return thread.ID, messages[0].ID, nil
 	}
@@ -173,19 +191,25 @@ func (c *Client) PostForumThread(ctx context.Context, channelID, title, content 
 
 // UpdateForumPost updates both the thread title and starter message.
 func (c *Client) UpdateForumPost(ctx context.Context, threadID, messageID, newTitle, newContent string) error {
-	_, err := c.session.ChannelEdit(threadID, &discordgo.ChannelEdit{
-		Name: format.Truncate(newTitle, 100),
+	err := retryableCtx(ctx, func() error {
+		_, err := c.session.ChannelEdit(threadID, &discordgo.ChannelEdit{
+			Name: format.Truncate(newTitle, 100),
+		})
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("failed to update thread title: %w", err)
 	}
 
 	if messageID != "" {
-		_, err = c.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
-			ID:      messageID,
-			Channel: threadID,
-			Content: &newContent,
-			Flags:   discordgo.MessageFlagsSuppressEmbeds,
+		err = retryableCtx(ctx, func() error {
+			_, err := c.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
+				ID:      messageID,
+				Channel: threadID,
+				Content: &newContent,
+				Flags:   discordgo.MessageFlagsSuppressEmbeds,
+			})
+			return err
 		})
 		if err != nil {
 			return fmt.Errorf("failed to update thread message: %w", err)
@@ -216,14 +240,24 @@ func (c *Client) ArchiveThread(ctx context.Context, threadID string) error {
 
 // SendDM sends a direct message to a user with link embeds suppressed.
 func (c *Client) SendDM(ctx context.Context, userID, text string) (channelID, messageID string, err error) {
-	channel, err := c.session.UserChannelCreate(userID)
+	var channel *discordgo.Channel
+	err = retryableCtx(ctx, func() error {
+		var err error
+		channel, err = c.session.UserChannelCreate(userID)
+		return err
+	})
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create DM channel: %w", err)
 	}
 
-	msg, err := c.session.ChannelMessageSendComplex(channel.ID, &discordgo.MessageSend{
-		Content: text,
-		Flags:   discordgo.MessageFlagsSuppressEmbeds,
+	var msg *discordgo.Message
+	err = retryableCtx(ctx, func() error {
+		var err error
+		msg, err = c.session.ChannelMessageSendComplex(channel.ID, &discordgo.MessageSend{
+			Content: text,
+			Flags:   discordgo.MessageFlagsSuppressEmbeds,
+		})
+		return err
 	})
 	if err != nil {
 		return "", "", fmt.Errorf("failed to send DM: %w", err)
@@ -240,11 +274,14 @@ func (c *Client) SendDM(ctx context.Context, userID, text string) (channelID, me
 
 // UpdateDM updates an existing DM message.
 func (c *Client) UpdateDM(ctx context.Context, channelID, messageID, newText string) error {
-	_, err := c.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
-		ID:      messageID,
-		Channel: channelID,
-		Content: &newText,
-		Flags:   discordgo.MessageFlagsSuppressEmbeds,
+	err := retryableCtx(ctx, func() error {
+		_, err := c.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
+			ID:      messageID,
+			Channel: channelID,
+			Content: &newText,
+			Flags:   discordgo.MessageFlagsSuppressEmbeds,
+		})
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("failed to update DM: %w", err)
@@ -261,17 +298,8 @@ func (c *Client) UpdateDM(ctx context.Context, channelID, messageID, newText str
 // ResolveChannelID resolves a channel name to its ID.
 func (c *Client) ResolveChannelID(ctx context.Context, channelName string) string {
 	// If it looks like an ID already (long numeric string), return it
-	if len(channelName) > 15 {
-		isID := true
-		for _, r := range channelName {
-			if r < '0' || r > '9' {
-				isID = false
-				break
-			}
-		}
-		if isID {
-			return channelName
-		}
+	if len(channelName) > 15 && isAllDigits(channelName) {
+		return channelName
 	}
 
 	// Check cache
@@ -842,4 +870,17 @@ func (c *Client) MessageContent(ctx context.Context, channelID, messageID string
 		return "", fmt.Errorf("failed to fetch message: %w", err)
 	}
 	return msg.Content, nil
+}
+
+// isAllDigits returns true if the string is non-empty and contains only digit characters.
+func isAllDigits(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

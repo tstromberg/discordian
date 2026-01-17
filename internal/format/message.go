@@ -71,11 +71,6 @@ func StateEmoji(state PRState) string {
 	}
 }
 
-// StateParam returns the URL state parameter suffix for a PR state.
-func StateParam(state PRState) string {
-	return "?st=" + string(state)
-}
-
 // StateText returns the human-readable text label for a PR state.
 // Returns empty string for states that don't need text labels.
 func StateText(state PRState) string {
@@ -132,7 +127,7 @@ func ChannelMessage(p ChannelMessageParams) string {
 	if p.ChannelName != "" && strings.EqualFold(p.ChannelName, p.Repo) {
 		prRef = fmt.Sprintf("#%d", p.Number)
 	}
-	sb.WriteString(fmt.Sprintf("[%s](%s%s)", prRef, p.PRURL, StateParam(p.State)))
+	sb.WriteString(fmt.Sprintf("[%s](%s?st=%s)", prRef, p.PRURL, p.State))
 
 	// Title with dot delimiter
 	sb.WriteString(" · ")
@@ -197,10 +192,6 @@ func ForumThreadTitle(repo string, number int, title string) string {
 	return prefix + Truncate(title, maxTitleLen)
 }
 
-// ForumThreadContent formats the content for a forum thread starter message.
-func ForumThreadContent(p ChannelMessageParams) string {
-	return ChannelMessage(p)
-}
 
 // DMMessage formats a DM notification.
 func DMMessage(p ChannelMessageParams, action string) string {

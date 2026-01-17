@@ -811,7 +811,7 @@ func (cm *coordinatorManager) UserMappings(ctx context.Context, guildID string) 
 		}
 
 		// Get the users map from config (githubUsername -> discordID)
-		users := cfg.GetUsers()
+		users := cfg.UserMappings()
 		slog.Debug("collecting config user mappings",
 			"org", org,
 			"user_count", len(users))

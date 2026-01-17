@@ -147,17 +147,22 @@ func TestSearchPRs(t *testing.T) {
 			}
 
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(response)
+			if err := json.NewEncoder(w).Encode(response); err != nil {
+				t.Errorf("Failed to encode response: %v", err)
+			}
 		}))
 		defer server.Close()
 
 		// Create a GitHub client pointing to the mock server
 		client := github.NewClient(nil)
-		client.BaseURL, _ = client.BaseURL.Parse(server.URL + "/")
+		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
+		if err != nil {
+			t.Fatalf("Failed to parse URL: %v", err)
+		}
+		client.BaseURL = parsedURL
 
 		searcher := NewSearcher(&AppClient{}, nil)
 		results, err := searcher.searchPRs(ctx, client, "test query")
-
 		if err != nil {
 			t.Errorf("searchPRs() error = %v, want nil", err)
 		}
@@ -194,16 +199,21 @@ func TestSearchPRs(t *testing.T) {
 			}
 
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(response)
+			if err := json.NewEncoder(w).Encode(response); err != nil {
+				t.Errorf("Failed to encode response: %v", err)
+			}
 		}))
 		defer server.Close()
 
 		client := github.NewClient(nil)
-		client.BaseURL, _ = client.BaseURL.Parse(server.URL + "/")
+		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
+		if err != nil {
+			t.Fatalf("Failed to parse URL: %v", err)
+		}
+		client.BaseURL = parsedURL
 
 		searcher := NewSearcher(&AppClient{}, nil)
 		results, err := searcher.searchPRs(ctx, client, "test query")
-
 		if err != nil {
 			t.Errorf("searchPRs() error = %v, want nil", err)
 		}
@@ -227,16 +237,21 @@ func TestSearchPRs(t *testing.T) {
 			}
 
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(response)
+			if err := json.NewEncoder(w).Encode(response); err != nil {
+				t.Errorf("Failed to encode response: %v", err)
+			}
 		}))
 		defer server.Close()
 
 		client := github.NewClient(nil)
-		client.BaseURL, _ = client.BaseURL.Parse(server.URL + "/")
+		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
+		if err != nil {
+			t.Fatalf("Failed to parse URL: %v", err)
+		}
+		client.BaseURL = parsedURL
 
 		searcher := NewSearcher(&AppClient{}, nil)
 		results, err := searcher.searchPRs(ctx, client, "test query")
-
 		if err != nil {
 			t.Errorf("searchPRs() error = %v, want nil", err)
 		}
@@ -263,16 +278,21 @@ func TestSearchPRs(t *testing.T) {
 			}
 
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(response)
+			if err := json.NewEncoder(w).Encode(response); err != nil {
+				t.Errorf("Failed to encode response: %v", err)
+			}
 		}))
 		defer server.Close()
 
 		client := github.NewClient(nil)
-		client.BaseURL, _ = client.BaseURL.Parse(server.URL + "/")
+		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
+		if err != nil {
+			t.Fatalf("Failed to parse URL: %v", err)
+		}
+		client.BaseURL = parsedURL
 
 		searcher := NewSearcher(&AppClient{}, nil)
 		results, err := searcher.searchPRs(ctx, client, "test query")
-
 		if err != nil {
 			t.Errorf("searchPRs() error = %v, want nil", err)
 		}
@@ -290,15 +310,21 @@ func TestSearchPRs(t *testing.T) {
 	t.Run("search with API error", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"message": "Internal Server Error"}`))
+			if _, err := w.Write([]byte(`{"message": "Internal Server Error"}`)); err != nil {
+				t.Errorf("Failed to write response: %v", err)
+			}
 		}))
 		defer server.Close()
 
 		client := github.NewClient(nil)
-		client.BaseURL, _ = client.BaseURL.Parse(server.URL + "/")
+		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
+		if err != nil {
+			t.Fatalf("Failed to parse URL: %v", err)
+		}
+		client.BaseURL = parsedURL
 
 		searcher := NewSearcher(&AppClient{}, nil)
-		_, err := searcher.searchPRs(ctx, client, "test query")
+		_, err = searcher.searchPRs(ctx, client, "test query")
 
 		if err == nil {
 			t.Error("searchPRs() error = nil, want error")
@@ -346,16 +372,21 @@ func TestSearchPRs(t *testing.T) {
 			}
 
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(response)
+			if err := json.NewEncoder(w).Encode(response); err != nil {
+				t.Errorf("Failed to encode response: %v", err)
+			}
 		}))
 		defer server.Close()
 
 		client := github.NewClient(nil)
-		client.BaseURL, _ = client.BaseURL.Parse(server.URL + "/")
+		parsedURL, err := client.BaseURL.Parse(server.URL + "/")
+		if err != nil {
+			t.Fatalf("Failed to parse URL: %v", err)
+		}
+		client.BaseURL = parsedURL
 
 		searcher := NewSearcher(&AppClient{}, nil)
 		results, err := searcher.searchPRs(ctx, client, "test query")
-
 		if err != nil {
 			t.Errorf("searchPRs() error = %v, want nil", err)
 		}
@@ -366,3 +397,6 @@ func TestSearchPRs(t *testing.T) {
 	})
 }
 
+// Note: ListOpenPRs, ListClosedPRs, ListAuthoredPRs, and ListReviewRequestedPRs
+// are difficult to test without an actual AppClient or refactoring to use interfaces.
+// These methods are tested indirectly through integration tests.

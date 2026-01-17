@@ -45,7 +45,7 @@ type SprinklerConfig struct {
 }
 
 // NewSprinklerClient creates a new sprinkler WebSocket client using the library.
-func NewSprinklerClient(cfg SprinklerConfig) (*SprinklerClient, error) {
+func NewSprinklerClient(ctx context.Context, cfg SprinklerConfig) (*SprinklerClient, error) {
 	if cfg.ServerURL == "" {
 		return nil, errors.New("serverURL is required")
 	}
@@ -73,10 +73,10 @@ func NewSprinklerClient(cfg SprinklerConfig) (*SprinklerClient, error) {
 		Logger:       logger,
 		ServerURL:    cfg.ServerURL,
 		Organization: cfg.Organization,
+		UserAgent:    "discordian/v1.0.0",
 		TokenProvider: func() (string, error) {
-			// Use background context for token fetching
-			// The token provider interface doesn't have context parameter in the library
-			return cfg.TokenProvider.InstallationToken(context.Background())
+			// Use context from parent scope for token fetching
+			return cfg.TokenProvider.InstallationToken(ctx)
 		},
 		OnConnect:    cfg.OnConnect,
 		OnDisconnect: cfg.OnDisconnect,

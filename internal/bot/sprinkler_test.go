@@ -10,7 +10,7 @@ import (
 )
 
 func TestNewSprinklerClient_MissingServerURL(t *testing.T) {
-	_, err := NewSprinklerClient(SprinklerConfig{
+	_, err := NewSprinklerClient(context.Background(), SprinklerConfig{
 		Organization:  "testorg",
 		TokenProvider: &mockTokenProvider{token: "token"},
 	})
@@ -20,7 +20,7 @@ func TestNewSprinklerClient_MissingServerURL(t *testing.T) {
 }
 
 func TestNewSprinklerClient_MissingOrganization(t *testing.T) {
-	_, err := NewSprinklerClient(SprinklerConfig{
+	_, err := NewSprinklerClient(context.Background(), SprinklerConfig{
 		ServerURL:     "wss://example.com/ws",
 		TokenProvider: &mockTokenProvider{token: "token"},
 	})
@@ -30,7 +30,7 @@ func TestNewSprinklerClient_MissingOrganization(t *testing.T) {
 }
 
 func TestNewSprinklerClient_MissingTokenProvider(t *testing.T) {
-	_, err := NewSprinklerClient(SprinklerConfig{
+	_, err := NewSprinklerClient(context.Background(), SprinklerConfig{
 		ServerURL:    "wss://example.com/ws",
 		Organization: "testorg",
 	})
@@ -40,7 +40,7 @@ func TestNewSprinklerClient_MissingTokenProvider(t *testing.T) {
 }
 
 func TestNewSprinklerClient_Success(t *testing.T) {
-	client, err := NewSprinklerClient(SprinklerConfig{
+	client, err := NewSprinklerClient(context.Background(), SprinklerConfig{
 		ServerURL:     "wss://example.com/ws",
 		Organization:  "testorg",
 		TokenProvider: &mockTokenProvider{token: "token"},
@@ -56,7 +56,7 @@ func TestNewSprinklerClient_Success(t *testing.T) {
 }
 
 func TestSprinklerClient_Stop(t *testing.T) {
-	client, err := NewSprinklerClient(SprinklerConfig{
+	client, err := NewSprinklerClient(context.Background(), SprinklerConfig{
 		ServerURL:     "wss://example.com/ws",
 		Organization:  "testorg",
 		TokenProvider: &mockTokenProvider{token: "token"},
@@ -216,7 +216,7 @@ func TestTurnHTTPClient_Check_RequestError(t *testing.T) {
 
 func TestTurnHTTPClient_Check_ContextCanceled(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(10 * time.Millisecond) // Short delay for testing
+		time.Sleep(10 * time.Millisecond)              // Short delay for testing
 		_ = json.NewEncoder(w).Encode(CheckResponse{}) //nolint:errcheck // test handler
 	}))
 	defer server.Close()

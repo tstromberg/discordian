@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -73,13 +74,7 @@ func TestManager_ChannelsForRepo(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := m.ChannelsForRepo(tt.org, tt.repo)
 			for _, want := range tt.contains {
-				found := false
-				for _, ch := range got {
-					if ch == want {
-						found = true
-						break
-					}
-				}
+				found := slices.Contains(got, want)
 				if !found {
 					t.Errorf("ChannelsForRepo() = %v, want to contain %q", got, want)
 				}
@@ -660,10 +655,10 @@ func TestManager_When(t *testing.T) {
 		want    string
 	}{
 		{
-			name: "no config returns default",
-			org:  "nonexistent",
+			name:    "no config returns default",
+			org:     "nonexistent",
 			channel: "any",
-			want: "immediate",
+			want:    "immediate",
 		},
 		{
 			name: "global when setting",

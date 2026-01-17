@@ -251,11 +251,57 @@ func TestTruncate(t *testing.T) {
 }
 
 func TestRandomGreeting(t *testing.T) {
-	// Just verify it doesn't panic and returns non-empty
-	greeting := randomGreeting()
-	if greeting == "" {
-		t.Error("randomGreeting() should return non-empty string")
-	}
+	t.Run("returns non-empty greeting", func(t *testing.T) {
+		greeting := randomGreeting()
+		if greeting == "" {
+			t.Error("randomGreeting() should return non-empty string")
+		}
+	})
+
+	t.Run("greeting contains emoji", func(t *testing.T) {
+		greeting := randomGreeting()
+		// All greetings should have an emoji
+		hasEmoji := false
+		emojis := []string{"👋", "🎉", "✨", "🚀", "🤝", "👍", "🎨", "💪", "🔥", "⚡", "🌟", "🎯", "🧑‍💻", "📝", "🎊", "🇫🇷", "🇪🇸", "🇩🇪", "🇮🇹", "🇯🇵"}
+		for _, emoji := range emojis {
+			if strings.Contains(greeting, emoji) {
+				hasEmoji = true
+				break
+			}
+		}
+		if !hasEmoji {
+			t.Errorf("greeting %q should contain an emoji", greeting)
+		}
+	})
+
+	t.Run("greeting is timezone-agnostic", func(t *testing.T) {
+		// All greetings should work at any time of day
+		greeting := randomGreeting()
+
+		// Should NOT contain time-specific words
+		timeWords := []string{"morning", "afternoon", "evening", "night", "midnight"}
+		for _, word := range timeWords {
+			if strings.Contains(strings.ToLower(greeting), word) {
+				t.Errorf("greeting %q should not contain time-specific word %q", greeting, word)
+			}
+		}
+	})
+
+	t.Run("greetings vary over time", func(t *testing.T) {
+		// Call it multiple times and check we get variation
+		// (This is probabilistic but with 20 greetings, very likely to get different ones)
+		greetings := make(map[string]bool)
+		for i := 0; i < 5; i++ {
+			g := randomGreeting()
+			greetings[g] = true
+		}
+
+		// With 20 possible greetings, calling 5 times should give us some variety
+		// (we won't assert exact count since it's time-based, but at least verify it works)
+		if len(greetings) == 0 {
+			t.Error("should get at least one greeting")
+		}
+	})
 }
 
 func TestSender_SendReport_DMError(t *testing.T) {

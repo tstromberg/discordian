@@ -19,6 +19,7 @@ import (
 
 	"github.com/codeGROOVE-dev/discordian/internal/bot"
 	"github.com/codeGROOVE-dev/discordian/internal/config"
+	"github.com/codeGROOVE-dev/discordian/internal/dailyreport"
 	"github.com/codeGROOVE-dev/discordian/internal/discord"
 	"github.com/codeGROOVE-dev/discordian/internal/format"
 	"github.com/codeGROOVE-dev/discordian/internal/github"
@@ -185,23 +186,23 @@ func (ca *configAdapter) Config(org string) (usermapping.OrgConfig, bool) {
 
 // coordinatorManager manages bot coordinators for multiple GitHub orgs.
 type coordinatorManager struct {
-	cfg            config.ServerConfig
-	githubManager  *github.Manager
-	configManager  *config.Manager
-	guildManager   *discord.GuildManager
-	store          state.Store
-	notifyMgr      *notify.Manager
-	reverseMapper  *usermapping.ReverseMapper              // Discord ID -> GitHub username
-	active         map[string]context.CancelFunc           // org -> cancel func
-	failed         map[string]time.Time                    // org -> last failure time
-	discordClients map[string]*discord.Client              // guildID -> client
-	slashHandlers  map[string]*discord.SlashCommandHandler // guildID -> handler
-	coordinators   map[string]*bot.Coordinator             // org -> coordinator
 	startTime      time.Time
-	lastEventTime  map[string]time.Time // org -> last event time
-	dmsSent        int64                // Total DMs sent since start
-	dailyReports   int64                // Total daily reports sent since start
-	channelMsgs    int64                // Total channel messages sent since start
+	store          state.Store
+	slashHandlers  map[string]*discord.SlashCommandHandler
+	discordClients map[string]*discord.Client
+	lastEventTime  map[string]time.Time
+	notifyMgr      *notify.Manager
+	reverseMapper  *usermapping.ReverseMapper
+	active         map[string]context.CancelFunc
+	guildManager   *discord.GuildManager
+	failed         map[string]time.Time
+	coordinators   map[string]*bot.Coordinator
+	configManager  *config.Manager
+	githubManager  *github.Manager
+	cfg            config.ServerConfig
+	dmsSent        int64
+	dailyReports   int64
+	channelMsgs    int64
 	mu             sync.Mutex
 }
 
@@ -390,7 +391,7 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 			"sprinkler_url", sprinklerURL)
 
 		// Create sprinkler client with token provider (will fetch fresh tokens automatically)
-		sprinklerClient, err := bot.NewSprinklerClient(bot.SprinklerConfig{
+		sprinklerClient, err := bot.NewSprinklerClient(orgCtx, bot.SprinklerConfig{
 			ServerURL:     sprinklerURL,
 			TokenProvider: tokenProvider,
 			Organization:  org,
@@ -480,6 +481,7 @@ func (cm *coordinatorManager) discordClientForGuild(_ context.Context, guildID s
 	slashHandler.SetReportGetter(cm)
 	slashHandler.SetUserMapGetter(cm)
 	slashHandler.SetChannelMapGetter(cm)
+	slashHandler.SetDailyReportGetter(cm)
 
 	// Register slash commands with Discord
 	if err := slashHandler.RegisterCommands(guildID); err != nil {
@@ -769,6 +771,180 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 		IncomingPRs: incomingPRs,
 		OutgoingPRs: outgoingPRs,
 		GeneratedAt: time.Now().Format(time.RFC3339),
+	}, nil
+}
+
+// DailyReport implements discord.DailyReportGetter interface.
+func (cm *coordinatorManager) DailyReport(ctx context.Context, guildID, userID string, force bool) (*discord.DailyReportDebug, error) {
+	slog.Info("daily report requested",
+		"guild_id", guildID,
+		"user_id", userID,
+		"force", force)
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	// Find orgs for this guild
+	var orgsForGuild []string
+	for org := range cm.active {
+		cfg, exists := cm.configManager.Config(org)
+		if exists && cfg.Global.GuildID == guildID {
+			orgsForGuild = append(orgsForGuild, org)
+		}
+	}
+
+	if len(orgsForGuild) == 0 {
+		return nil, fmt.Errorf("no org found for guild %s", guildID)
+	}
+
+	// Find GitHub username
+	var githubUsername string
+	for _, org := range orgsForGuild {
+		coord, exists := cm.coordinators[org]
+		if !exists {
+			continue
+		}
+		forwardCache := coord.ExportUserMapperCache()
+		for ghUser, discordID := range forwardCache {
+			if discordID == userID {
+				githubUsername = ghUser
+				break
+			}
+		}
+		if githubUsername != "" {
+			break
+		}
+	}
+
+	// Try reverse mapper if not found
+	if githubUsername == "" {
+		githubUsername = cm.reverseMapper.GitHubUsername(ctx, userID, &configAdapter{cm.configManager}, orgsForGuild)
+	}
+
+	if githubUsername == "" {
+		return nil, errors.New("no GitHub username mapping found for Discord user")
+	}
+
+	// Get Discord client for this guild
+	discordClient, exists := cm.discordClients[guildID]
+	if !exists {
+		return nil, fmt.Errorf("no Discord client for guild %s", guildID)
+	}
+
+	// Check if user is currently online
+	isOnline := discordClient.IsUserActive(ctx, userID)
+
+	// Get daily report state
+	reportInfo, _ := cm.store.DailyReportInfo(ctx, userID)
+	now := time.Now()
+
+	// Calculate timing info
+	hoursSinceLastSent := float64(0)
+	if !reportInfo.LastSentAt.IsZero() {
+		hoursSinceLastSent = now.Sub(reportInfo.LastSentAt).Hours()
+	}
+
+	nextEligibleAt := reportInfo.LastSentAt.Add(20 * time.Hour)
+
+	// Search for PRs (same as Report method)
+	var incomingPRs []discord.PRSummary
+	var outgoingPRs []discord.PRSummary
+
+	searcher := github.NewSearcher(cm.githubManager.AppClient(), slog.Default())
+
+	for _, org := range orgsForGuild {
+		client, exists := cm.githubManager.ClientForOrg(org)
+		if !exists {
+			continue
+		}
+
+		turn := bot.NewTurnClient(cm.cfg.TurnURL, client)
+
+		// Search authored PRs
+		authored, err := searcher.ListAuthoredPRs(ctx, org, githubUsername)
+		if err == nil {
+			for _, pr := range authored {
+				summary := analyzePRForReport(ctx, pr, githubUsername, turn)
+				if summary != nil {
+					outgoingPRs = append(outgoingPRs, *summary)
+				}
+			}
+		}
+
+		// Search review-requested PRs
+		review, err := searcher.ListReviewRequestedPRs(ctx, org, githubUsername)
+		if err == nil {
+			for _, pr := range review {
+				summary := analyzePRForReport(ctx, pr, githubUsername, turn)
+				if summary != nil {
+					incomingPRs = append(incomingPRs, *summary)
+				}
+			}
+		}
+	}
+
+	// Determine eligibility
+	eligible := true
+	reason := "All conditions met"
+	reportSent := false
+
+	// Check conditions
+	switch {
+	case len(incomingPRs) == 0 && len(outgoingPRs) == 0:
+		eligible = false
+		reason = "No PRs found for user"
+	case !force && hoursSinceLastSent < 20:
+		eligible = false
+		reason = fmt.Sprintf("Rate limited: only %.1f hours since last report (need 20)", hoursSinceLastSent)
+	case !force && !isOnline:
+		eligible = false
+		reason = "User is offline"
+	default:
+		// eligible and reason already set
+	}
+
+	// Send report if forced or eligible
+	if force || eligible {
+		// Create daily report sender
+		sender := dailyreport.NewSender(cm.store, slog.Default())
+
+		// Register guild DM sender
+		sender.RegisterGuild(guildID, discordClient)
+
+		userInfo := dailyreport.UserBlockingInfo{
+			GitHubUsername: githubUsername,
+			DiscordUserID:  userID,
+			GuildID:        guildID,
+			IncomingPRs:    incomingPRs,
+			OutgoingPRs:    outgoingPRs,
+		}
+
+		// Send the report
+		if err := sender.SendReport(ctx, userInfo); err != nil {
+			slog.Error("failed to send daily report",
+				"error", err,
+				"github_user", githubUsername,
+				"discord_id", userID)
+			reason = fmt.Sprintf("Failed to send: %s", err)
+		} else {
+			reportSent = true
+			reason = "Report sent successfully"
+			cm.dailyReports++
+		}
+	}
+
+	return &discord.DailyReportDebug{
+		UserOnline:         isOnline,
+		LastSentAt:         reportInfo.LastSentAt,
+		NextEligibleAt:     nextEligibleAt,
+		LastSeenActiveAt:   time.Time{}, // Not tracked yet
+		HoursSinceLastSent: hoursSinceLastSent,
+		MinutesActive:      0, // Not tracked yet
+		Eligible:           eligible,
+		Reason:             reason,
+		IncomingPRCount:    len(incomingPRs),
+		OutgoingPRCount:    len(outgoingPRs),
+		ReportSent:         reportSent,
 	}, nil
 }
 

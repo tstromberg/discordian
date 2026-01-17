@@ -24,8 +24,8 @@ type ReverseMapper struct {
 }
 
 type reverseEntry struct {
-	githubUsername string
 	cachedAt       time.Time
+	githubUsername string
 }
 
 // NewReverseMapper creates a new reverse mapper.

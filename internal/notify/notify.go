@@ -59,11 +59,9 @@ func (m *Manager) RegisterGuild(guildID string, sender DiscordDMSender) {
 
 // Start begins the notification processing loop.
 func (m *Manager) Start(ctx context.Context) {
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.wg.Go(func() {
 		m.run(ctx)
-	}()
+	})
 }
 
 // Stop stops the notification manager.

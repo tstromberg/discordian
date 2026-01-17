@@ -19,10 +19,10 @@ type Manager struct {
 
 // OrgClient wraps a GitHub client for an org with additional functionality.
 type OrgClient struct {
-	org            string
-	installationID int64
 	appClient      *AppClient
 	client         *github.Client
+	org            string
+	installationID int64
 }
 
 // NewManager creates a new GitHub installation manager.

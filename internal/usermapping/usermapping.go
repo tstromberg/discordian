@@ -26,8 +26,8 @@ type ConfigLookup interface {
 
 // cacheEntry stores a cached mapping with timestamp.
 type cacheEntry struct {
-	discordID string
 	cachedAt  time.Time
+	discordID string
 }
 
 // Mapper maps GitHub usernames to Discord user IDs.
@@ -145,7 +145,7 @@ func (m *Mapper) cacheResult(githubUsername, discordID string) {
 
 // isAllDigits returns true if the string is non-empty and contains only digit characters.
 func isAllDigits(s string) bool {
-	if len(s) == 0 {
+	if s == "" {
 		return false
 	}
 	for _, r := range s {

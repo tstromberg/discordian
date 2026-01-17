@@ -94,14 +94,14 @@ func StateText(state PRState) string {
 
 // ChannelMessageParams contains parameters for formatting a channel message.
 type ChannelMessageParams struct {
-	ActionUsers []ActionUser // Users who need to take action
 	Owner       string
 	Repo        string
 	Title       string
 	Author      string
 	State       PRState
 	PRURL       string
-	ChannelName string // If provided and matches Repo (case-insensitive), use short form #123
+	ChannelName string
+	ActionUsers []ActionUser
 	Number      int
 }
 
@@ -192,7 +192,6 @@ func ForumThreadTitle(repo string, number int, title string) string {
 	return prefix + Truncate(title, maxTitleLen)
 }
 
-
 // DMMessage formats a DM notification.
 func DMMessage(p ChannelMessageParams, action string) string {
 	emoji := StateEmoji(p.State)
@@ -222,16 +221,16 @@ func DMMessage(p ChannelMessageParams, action string) string {
 
 // StateAnalysisParams contains parameters for StateFromAnalysis.
 type StateAnalysisParams struct {
+	WorkflowState      string
+	ChecksFailing      int
+	ChecksPending      int
+	ChecksWaiting      int
+	UnresolvedComments int
 	Merged             bool
 	Closed             bool
 	Draft              bool
 	MergeConflict      bool
 	Approved           bool
-	ChecksFailing      int
-	ChecksPending      int
-	ChecksWaiting      int
-	UnresolvedComments int
-	WorkflowState      string
 }
 
 // StateFromAnalysis determines PRState from Turn API analysis.

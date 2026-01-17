@@ -125,47 +125,33 @@ func (s *Sender) SendReport(ctx context.Context, userInfo UserBlockingInfo) erro
 	return nil
 }
 
-// randomGreeting returns a friendly greeting based on the current time of day.
+// randomGreeting returns a friendly greeting (timezone-agnostic).
 func randomGreeting() string {
-	now := time.Now()
-	h := now.Hour()
-
-	var greetings []string
-
-	switch {
-	case h >= 6 && h < 12:
-		greetings = []string{
-			"Good morning!",
-			"Coffee's ready!",
-			"Happy morning!",
-			"Hello sunshine!",
-			"Morning vibes!",
-		}
-	case h >= 12 && h < 17:
-		greetings = []string{
-			"Hey there!",
-			"Good afternoon!",
-			"Time to create!",
-			"Hey friend!",
-			"Greetings!",
-		}
-	case h >= 17 && h < 22:
-		greetings = []string{
-			"Good evening!",
-			"Hey there!",
-			"Evening check-in!",
-			"Still going strong!",
-		}
-	default:
-		greetings = []string{
-			"Burning the midnight oil?",
-			"Night owl!",
-			"Still at it!",
-			"Late night vibes!",
-		}
+	greetings := []string{
+		"👋 Hey there!",
+		"🎉 Hello!",
+		"✨ Greetings!",
+		"🚀 Welcome back!",
+		"🤝 Hey friend!",
+		"👍 What's up!",
+		"🎨 Ready to ship!",
+		"💪 Let's do this!",
+		"🔥 Time to review!",
+		"⚡ PR time!",
+		"🌟 Here we go!",
+		"🎯 Focus mode!",
+		"🧑‍💻 Code time!",
+		"📝 Review time!",
+		"🎊 Daily update!",
+		"🇫🇷 Bonjour!",
+		"🇪🇸 Hola!",
+		"🇩🇪 Guten Tag!",
+		"🇮🇹 Ciao!",
+		"🇯🇵 こんにちは!",
 	}
 
-	// Pick greeting based on time for variety
+	// Pick greeting based on time for variety (using minutes to cycle through greetings)
+	now := time.Now()
 	i := (now.Hour()*60 + now.Minute()) % len(greetings)
 	return greetings[i]
 }

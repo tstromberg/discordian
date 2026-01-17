@@ -93,19 +93,19 @@ type PRInfo struct {
 	State     string   `json:"state"`
 	UpdatedAt string   `json:"updated_at"`
 	Commits   []string `json:"commits,omitempty"`
+	Assignees []string `json:"assignees,omitempty"`
 	Draft     bool     `json:"draft"`
 	Merged    bool     `json:"merged"`
 	Closed    bool     `json:"closed"`
-	Assignees []string `json:"assignees,omitempty"`
 }
 
 // Analysis contains the PR analysis result.
 type Analysis struct {
-	Tags               []string          `json:"tags"`
 	NextAction         map[string]Action `json:"next_action"`
-	Checks             Checks            `json:"checks"`
 	WorkflowState      string            `json:"workflow_state"`
 	Size               string            `json:"size"`
+	Tags               []string          `json:"tags"`
+	Checks             Checks            `json:"checks"`
 	UnresolvedComments int               `json:"unresolved_comments"`
 	ReadyToMerge       bool              `json:"ready_to_merge"`
 	Approved           bool              `json:"approved"`

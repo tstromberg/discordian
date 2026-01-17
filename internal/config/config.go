@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,16 +53,16 @@ func (c *DiscordConfig) UserMappings() map[string]string {
 // GlobalConfig holds global settings for the org.
 type GlobalConfig struct {
 	GuildID         string `yaml:"guild_id"`
+	When            string `yaml:"when"`
 	ReminderDMDelay int    `yaml:"reminder_dm_delay"`
-	When            string `yaml:"when"` // When to post threads: "immediate" (default), "assigned", "blocked", "passing"
 }
 
 // ChannelConfig holds per-channel settings.
 type ChannelConfig struct {
-	Repos           []string `yaml:"repos"`
 	ReminderDMDelay *int     `yaml:"reminder_dm_delay"`
-	When            *string  `yaml:"when"` // Optional: when to post threads ("immediate", "assigned", "blocked", "passing")
-	Type            string   `yaml:"type"` // "forum" or "text"
+	When            *string  `yaml:"when"`
+	Type            string   `yaml:"type"`
+	Repos           []string `yaml:"repos"`
 	Mute            bool     `yaml:"mute"`
 }
 
@@ -341,15 +342,7 @@ func (m *Manager) ChannelsForRepo(org, repo string) []string {
 
 	// Auto-discover: add repo-named channel unless already included or muted
 	autoChannel := strings.ToLower(repo)
-	addAuto := true
-
-	// Check if already included
-	for _, existing := range channels {
-		if existing == autoChannel {
-			addAuto = false
-			break
-		}
-	}
+	addAuto := !slices.Contains(channels, autoChannel)
 
 	// Check if auto-discovered channel is muted
 	if addAuto {

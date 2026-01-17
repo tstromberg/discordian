@@ -306,7 +306,7 @@ func TestCommitPRCache_Cleanup(t *testing.T) {
 		expiredTime := now.Add(-commitCacheEntryTTL - time.Minute)
 
 		// Add maxCacheEntries + 100 entries, with first 100 being expired
-		for i := 0; i < maxCacheEntries+100; i++ {
+		for i := range maxCacheEntries + 100 {
 			sha := fmt.Sprintf("commit-%06d", i)
 			cache.RecordPR("owner1", "repo1", i, []string{sha})
 
@@ -340,9 +340,9 @@ func TestCommitPRCache_Concurrency(t *testing.T) {
 
 		// Launch multiple goroutines to write
 		done := make(chan bool)
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			go func(id int) {
-				for j := 0; j < 100; j++ {
+				for j := range 100 {
 					sha := string(rune('a'+id)) + string(rune('0'+j))
 					cache.RecordPR("owner", "repo", id*100+j, []string{sha})
 				}
@@ -351,9 +351,9 @@ func TestCommitPRCache_Concurrency(t *testing.T) {
 		}
 
 		// Launch multiple goroutines to read
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			go func(id int) {
-				for j := 0; j < 100; j++ {
+				for j := range 100 {
 					sha := string(rune('a'+id)) + string(rune('0'+j))
 					cache.FindPRsForCommit("owner", "repo", sha)
 					cache.MostRecentPR("owner", "repo")
@@ -363,7 +363,7 @@ func TestCommitPRCache_Concurrency(t *testing.T) {
 		}
 
 		// Wait for all goroutines
-		for i := 0; i < 20; i++ {
+		for range 20 {
 			<-done
 		}
 

@@ -157,7 +157,7 @@ func (m *mockDiscordClient) GuildID() string {
 	return m.guildID
 }
 
-func (m *mockDiscordClient) FindForumThread(_ context.Context, channelID, prURL string) (string, string, bool) {
+func (m *mockDiscordClient) FindForumThread(_ context.Context, channelID, prURL string) (threadID, messageID string, found bool) {
 	key := channelID + ":" + prURL
 	if thread, exists := m.foundForumThreads[key]; exists {
 		return thread.threadID, thread.messageID, true
@@ -184,7 +184,7 @@ func (m *mockDiscordClient) MessageContent(_ context.Context, channelID, message
 	return "", fmt.Errorf("message not found")
 }
 
-func (m *mockDiscordClient) FindDMForPR(_ context.Context, userID, prURL string) (string, string, bool) {
+func (m *mockDiscordClient) FindDMForPR(_ context.Context, userID, prURL string) (channelID, messageID string, found bool) {
 	key := userID + ":" + prURL
 	if dm, exists := m.existingDMs[key]; exists {
 		return dm.channelID, dm.messageID, true
@@ -193,12 +193,12 @@ func (m *mockDiscordClient) FindDMForPR(_ context.Context, userID, prURL string)
 }
 
 type mockConfigManager struct {
-	configs         map[string]*config.DiscordConfig
-	channels        map[string][]string // org:repo -> channels
-	whenSettings    map[string]string   // org:channel -> when value
-	reloadCount     int
+	configs          map[string]*config.DiscordConfig
+	channels         map[string][]string // org:repo -> channels
+	whenSettings     map[string]string   // org:channel -> when value
+	reloadCount      int
 	shouldFailReload bool
-	shouldFailLoad  bool
+	shouldFailLoad   bool
 }
 
 func newMockConfigManager() *mockConfigManager {
@@ -331,6 +331,7 @@ func (m *mockPRSearcher) ListClosedPRs(_ context.Context, _ string, _ int) ([]PR
 // mockStore wraps a real store but allows injection of failures for testing
 type mockStore struct {
 	state.Store
+
 	pendingDMs            []*state.PendingDM
 	shouldFailPendingDMs  bool
 	failRemoveDMID        string
@@ -1199,7 +1200,7 @@ func TestTagTracker_Mark(t *testing.T) {
 		tracker := newTagTracker()
 
 		// Add more than maxTagTrackerEntries
-		for i := 0; i < maxTagTrackerEntries+50; i++ {
+		for i := range maxTagTrackerEntries + 50 {
 			prURL := fmt.Sprintf("https://github.com/o/r/pull/%d", i)
 			tracker.mark(prURL, "user")
 		}
@@ -1940,7 +1941,10 @@ func TestCoordinator_CancelPendingDMsForPR(t *testing.T) {
 	coord.Wait()
 
 	// Verify DM was queued
-	pendingDMs, _ := store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
+	pendingDMs, err := store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("Failed to get pending DMs: %v", err)
+	}
 	initialCount := len(pendingDMs)
 	if initialCount == 0 {
 		t.Skip("No pending DMs were created, test cannot proceed")
@@ -1968,7 +1972,10 @@ func TestCoordinator_CancelPendingDMsForPR(t *testing.T) {
 	coord.Wait()
 
 	// Verify pending DMs were cancelled
-	pendingDMs, _ = store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
+	pendingDMs, err = store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("Failed to get pending DMs: %v", err)
+	}
 	if len(pendingDMs) >= initialCount {
 		t.Errorf("Expected pending DMs to be cancelled, had %d initially, now have %d", initialCount, len(pendingDMs))
 	}
@@ -2166,12 +2173,12 @@ func TestCoordinator_ProcessTurnAPIError(t *testing.T) {
 
 func TestCoordinator_ProcessForumChannelWhenThresholds(t *testing.T) {
 	tests := []struct {
-		name            string
-		when            string
-		workflowState   string
-		assignees       []string
-		nextAction      map[string]Action
-		shouldPost      bool
+		name          string
+		when          string
+		workflowState string
+		assignees     []string
+		nextAction    map[string]Action
+		shouldPost    bool
 	}{
 		{
 			name:          "immediate mode",
@@ -2288,6 +2295,7 @@ func TestCoordinator_ProcessForumChannelWhenThresholds(t *testing.T) {
 
 type mockConfigManagerWithWhen struct {
 	*mockConfigManager
+
 	whenValue string
 }
 
@@ -2402,8 +2410,6 @@ func TestCoordinator_ProcessForumThread_UnchangedContent(t *testing.T) {
 	coord.ProcessEvent(ctx, event)
 	coord.Wait()
 
-	initialThreadCount := len(discord.forumThreads)
-
 	// Process again with same content - should skip update
 	event2 := SprinklerEvent{
 		URL:        "https://github.com/testorg/testrepo/pull/42",
@@ -2414,9 +2420,7 @@ func TestCoordinator_ProcessForumThread_UnchangedContent(t *testing.T) {
 	coord.Wait()
 
 	// Should not create additional threads for unchanged content
-	if len(discord.forumThreads) != initialThreadCount {
-		// Content may have changed, or could be an update
-	}
+	// (verification removed - content comparison is implementation detail)
 }
 
 func TestCoordinator_ProcessTextChannel_NoExistingMessage(t *testing.T) {
@@ -2504,8 +2508,6 @@ func TestCoordinator_ProcessTextChannel_UnchangedContent(t *testing.T) {
 	coord.ProcessEvent(ctx, event)
 	coord.Wait()
 
-	initialUpdates := len(discord.updatedMessages)
-
 	// Process again with same content
 	event2 := SprinklerEvent{
 		URL:        "https://github.com/testorg/testrepo/pull/42",
@@ -2516,9 +2518,7 @@ func TestCoordinator_ProcessTextChannel_UnchangedContent(t *testing.T) {
 	coord.Wait()
 
 	// May skip update if content unchanged
-	if len(discord.updatedMessages) > initialUpdates {
-		// Content unchanged, may skip update
-	}
+	// (verification removed - content comparison is implementation detail)
 }
 
 func TestCoordinator_ProcessMultipleChannels(t *testing.T) {
@@ -2907,8 +2907,6 @@ func TestCoordinator_ProcessDMForUser_UnchangedState(t *testing.T) {
 	coord.ProcessEvent(ctx, event)
 	coord.Wait()
 
-	initialDMs := len(discord.sentDMs)
-
 	// Process again with same state - should skip
 	event2 := SprinklerEvent{
 		URL:        "https://github.com/testorg/testrepo/pull/42",
@@ -2919,9 +2917,7 @@ func TestCoordinator_ProcessDMForUser_UnchangedState(t *testing.T) {
 	coord.Wait()
 
 	// Should not send duplicate DM for unchanged state
-	if len(discord.sentDMs) > initialDMs {
-		// May have sent update, but idempotency should prevent duplicates
-	}
+	// (verification removed - idempotency behavior is implementation detail)
 }
 
 func TestCoordinator_ProcessTextChannel_WithWhenThresholds(t *testing.T) {
@@ -3702,17 +3698,21 @@ func TestCoordinator_updateDMForClosedPR_MissingChannelOrMessageID(t *testing.T)
 	prURL := "https://github.com/owner/repo/pull/1"
 
 	// DM exists but missing channel ID
-	_ = store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
+	if err := store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
 		MessageID: "msg123",
 		// ChannelID missing
-	})
+	}); err != nil {
+		t.Fatalf("Failed to save DM info: %v", err)
+	}
 	coord.updateDMForClosedPR(ctx, "user123", prURL, format.StateMerged, "PR merged!")
 
 	// DM exists but missing message ID
-	_ = store.SaveDMInfo(ctx, "user456", prURL, state.DMInfo{
+	if err := store.SaveDMInfo(ctx, "user456", prURL, state.DMInfo{
 		ChannelID: "dm456",
 		// MessageID missing
-	})
+	}); err != nil {
+		t.Fatalf("Failed to save DM info: %v", err)
+	}
 	coord.updateDMForClosedPR(ctx, "user456", prURL, format.StateMerged, "PR merged!")
 
 	// No DMs should have been updated
@@ -3740,12 +3740,14 @@ func TestCoordinator_updateDMForClosedPR_IdempotencyCheck(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/1"
 
 	// DM exists with the same state already
-	_ = store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
-		ChannelID:  "dm123",
-		MessageID:  "msg123",
-		LastState:  string(format.StateMerged),
-		SentAt:     time.Now(),
-	})
+	if err := store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
+		ChannelID: "dm123",
+		MessageID: "msg123",
+		LastState: string(format.StateMerged),
+		SentAt:    time.Now(),
+	}); err != nil {
+		t.Fatalf("Failed to save DM info: %v", err)
+	}
 
 	// Try to update with same state - should be skipped (idempotency)
 	coord.updateDMForClosedPR(ctx, "user123", prURL, format.StateMerged, "PR merged!")
@@ -3775,12 +3777,14 @@ func TestCoordinator_updateDMForClosedPR_UpdateError(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/1"
 
 	// DM exists with different state
-	_ = store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
-		ChannelID:  "dm123",
-		MessageID:  "msg123",
-		LastState:  string(format.StateNeedsReview),
-		SentAt:     time.Now(),
-	})
+	if err := store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
+		ChannelID: "dm123",
+		MessageID: "msg123",
+		LastState: string(format.StateNeedsReview),
+		SentAt:    time.Now(),
+	}); err != nil {
+		t.Fatalf("Failed to save DM info: %v", err)
+	}
 
 	// Make Discord API fail
 	discord.shouldFailUpdateDM = true
@@ -3817,13 +3821,15 @@ func TestCoordinator_updateDMForClosedPR_Success(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/1"
 
 	// DM exists with different state
-	_ = store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
+	if err := store.SaveDMInfo(ctx, "user123", prURL, state.DMInfo{
 		ChannelID:   "dm123",
 		MessageID:   "msg123",
 		LastState:   string(format.StateNeedsReview),
 		MessageText: "Old message",
 		SentAt:      time.Now().Add(-1 * time.Hour),
-	})
+	}); err != nil {
+		t.Fatalf("Failed to save DM info: %v", err)
+	}
 
 	newMessage := "PR merged!"
 
@@ -3999,19 +4005,28 @@ func TestCoordinator_processTextChannel_ClaimFailedFindMessage(t *testing.T) {
 
 	checkResp := &CheckResponse{
 		PullRequest: PRInfo{
-			Title:  "Test PR",
-			State:  "open",
+			Title: "Test PR",
+			State: "open",
 		},
 	}
 
 	// Should find the message from other instance
-	err := coord.processTextChannel(ctx, channelID, "owner", "repo", 1, params, checkResp, state.ThreadInfo{}, false)
+	err := coord.processTextChannel(ctx, channelProcessParams{
+		channelID:  channelID,
+		owner:      "owner",
+		repo:       "repo",
+		number:     1,
+		params:     params,
+		checkResp:  checkResp,
+		threadInfo: state.ThreadInfo{},
+		exists:     false,
+	})
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
 	// Should have saved thread info for the found message
-	threadInfo, exists := store.Store.Thread(ctx, "owner", "repo", 1, channelID)
+	threadInfo, exists := store.Thread(ctx, "owner", "repo", 1, channelID)
 	if !exists {
 		t.Error("Thread info should be saved after finding message")
 	}
@@ -4056,13 +4071,22 @@ func TestCoordinator_processTextChannel_ClaimSucceededSearchFindsSameContent(t *
 
 	checkResp := &CheckResponse{
 		PullRequest: PRInfo{
-			Title:  "Test PR",
-			State:  "open",
+			Title: "Test PR",
+			State: "open",
 		},
 	}
 
 	// Should find existing message and skip creation
-	err := coord.processTextChannel(ctx, channelID, "owner", "repo", 1, params, checkResp, state.ThreadInfo{}, false)
+	err := coord.processTextChannel(ctx, channelProcessParams{
+		channelID:  channelID,
+		owner:      "owner",
+		repo:       "repo",
+		number:     1,
+		params:     params,
+		checkResp:  checkResp,
+		threadInfo: state.ThreadInfo{},
+		exists:     false,
+	})
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
@@ -4073,7 +4097,7 @@ func TestCoordinator_processTextChannel_ClaimSucceededSearchFindsSameContent(t *
 	}
 
 	// Should have saved thread info
-	threadInfo, exists := store.Store.Thread(ctx, "owner", "repo", 1, channelID)
+	threadInfo, exists := store.Thread(ctx, "owner", "repo", 1, channelID)
 	if !exists {
 		t.Error("Thread info should be saved")
 	}
@@ -4116,7 +4140,9 @@ func TestCoordinator_processTextChannel_UpdateFailsFallsThrough(t *testing.T) {
 		MessageText: "old content",
 		LastState:   string(format.StateNeedsReview),
 	}
-	_ = store.SaveThread(ctx, "owner", "repo", 1, channelID, oldThreadInfo)
+	if err := store.SaveThread(ctx, "owner", "repo", 1, channelID, oldThreadInfo); err != nil {
+		t.Fatalf("Failed to save thread: %v", err)
+	}
 
 	// Make UpdateMessage fail
 	discord.shouldFailUpdate = true
@@ -4129,13 +4155,22 @@ func TestCoordinator_processTextChannel_UpdateFailsFallsThrough(t *testing.T) {
 
 	checkResp := &CheckResponse{
 		PullRequest: PRInfo{
-			Title:  "Updated PR Title",
-			State:  "open",
+			Title: "Updated PR Title",
+			State: "open",
 		},
 	}
 
 	// Should try to update cached message, fail, then search and find the message
-	err := coord.processTextChannel(ctx, channelID, "owner", "repo", 1, params, checkResp, oldThreadInfo, true)
+	err := coord.processTextChannel(ctx, channelProcessParams{
+		channelID:  channelID,
+		owner:      "owner",
+		repo:       "repo",
+		number:     1,
+		params:     params,
+		checkResp:  checkResp,
+		threadInfo: oldThreadInfo,
+		exists:     true,
+	})
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
@@ -4146,7 +4181,7 @@ func TestCoordinator_processTextChannel_UpdateFailsFallsThrough(t *testing.T) {
 	}
 
 	// Should have found the message and updated thread info
-	threadInfo, exists := store.Store.Thread(ctx, "owner", "repo", 1, channelID)
+	threadInfo, exists := store.Thread(ctx, "owner", "repo", 1, channelID)
 	if !exists {
 		t.Error("Thread info should exist")
 	}
@@ -4191,7 +4226,16 @@ func TestCoordinator_processDMForUser_ClaimFailed(t *testing.T) {
 	store.shouldFailClaimDM = true
 
 	// Process DM - should not send since another instance claimed it
-	coord.processDMForUser(ctx, "owner", "repo", 1, checkResp, format.StateNeedsReview, prURL, "alice", "review")
+	coord.processDMForUser(ctx, dmProcessParams{
+		owner:      "owner",
+		repo:       "repo",
+		number:     1,
+		checkResp:  checkResp,
+		prState:    format.StateNeedsReview,
+		prURL:      prURL,
+		username:   "alice",
+		actionKind: "review",
+	})
 
 	// Should not have sent any DMs (another instance has it)
 	if len(discord.sentDMs) > 0 {
@@ -4243,7 +4287,16 @@ func TestCoordinator_processDMForUser_PendingDMUpdate(t *testing.T) {
 	}
 
 	// Process DM with new state - should update pending DM
-	coord.processDMForUser(ctx, "owner", "repo", 1, checkResp, format.StateNeedsReview, prURL, "alice", "review")
+	coord.processDMForUser(ctx, dmProcessParams{
+		owner:      "owner",
+		repo:       "repo",
+		number:     1,
+		checkResp:  checkResp,
+		prState:    format.StateNeedsReview,
+		prURL:      prURL,
+		username:   "alice",
+		actionKind: "review",
+	})
 
 	// Old pending DM should be removed (it gets removed and a new one queued)
 	// Since we're testing the removal logic
@@ -4291,7 +4344,16 @@ func TestCoordinator_processDMForUser_FindDMFallback(t *testing.T) {
 	}
 
 	// Process DM - should find existing DM and update it
-	coord.processDMForUser(ctx, "owner", "repo", 1, checkResp, format.StateNeedsReview, prURL, "alice", "review")
+	coord.processDMForUser(ctx, dmProcessParams{
+		owner:      "owner",
+		repo:       "repo",
+		number:     1,
+		checkResp:  checkResp,
+		prState:    format.StateNeedsReview,
+		prURL:      prURL,
+		username:   "alice",
+		actionKind: "review",
+	})
 
 	// Should have updated existing DM
 	if len(discord.updatedDMs) == 0 {
@@ -4336,7 +4398,9 @@ func TestCoordinator_processForumChannel_Archive(t *testing.T) {
 		MessageText: "old content",
 		LastState:   string(format.StateNeedsReview),
 	}
-	_ = store.SaveThread(ctx, "owner", "repo", 1, channelID, existingThread)
+	if err := store.SaveThread(ctx, "owner", "repo", 1, channelID, existingThread); err != nil {
+		t.Fatalf("Failed to save thread: %v", err)
+	}
 
 	checkResp := &CheckResponse{
 		PullRequest: PRInfo{
@@ -4347,7 +4411,16 @@ func TestCoordinator_processForumChannel_Archive(t *testing.T) {
 	}
 
 	// Process forum channel with merged PR
-	err := coord.processForumChannel(ctx, channelID, "owner", "repo", 1, params, checkResp, existingThread, true)
+	err := coord.processForumChannel(ctx, channelProcessParams{
+		channelID:  channelID,
+		owner:      "owner",
+		repo:       "repo",
+		number:     1,
+		params:     params,
+		checkResp:  checkResp,
+		threadInfo: existingThread,
+		exists:     true,
+	})
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
@@ -4406,13 +4479,22 @@ func TestCoordinator_processForumChannel_ClaimFailed(t *testing.T) {
 	}
 
 	// Process forum channel
-	err := coord.processForumChannel(ctx, channelID, "owner", "repo", 1, params, checkResp, state.ThreadInfo{}, false)
+	err := coord.processForumChannel(ctx, channelProcessParams{
+		channelID:  channelID,
+		owner:      "owner",
+		repo:       "repo",
+		number:     1,
+		params:     params,
+		checkResp:  checkResp,
+		threadInfo: state.ThreadInfo{},
+		exists:     false,
+	})
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
 	// Should have found and updated thread from other instance
-	threadInfo, exists := store.Store.Thread(ctx, "owner", "repo", 1, channelID)
+	threadInfo, exists := store.Thread(ctx, "owner", "repo", 1, channelID)
 	if !exists {
 		t.Error("Thread info should be saved after finding thread")
 	}
@@ -4465,7 +4547,16 @@ func TestCoordinator_processForumChannel_WhenThreshold(t *testing.T) {
 	}
 
 	// Process forum channel - should not create thread yet
-	err := coord.processForumChannel(ctx, channelID, "testorg", "repo", 1, params, checkResp, state.ThreadInfo{}, false)
+	err := coord.processForumChannel(ctx, channelProcessParams{
+		channelID:  channelID,
+		owner:      "testorg",
+		repo:       "repo",
+		number:     1,
+		params:     params,
+		checkResp:  checkResp,
+		threadInfo: state.ThreadInfo{},
+		exists:     false,
+	})
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
@@ -4534,7 +4625,9 @@ func TestCoordinator_processEventSync_AlreadyProcessed(t *testing.T) {
 
 	// Mark event as already processed
 	eventKey := fmt.Sprintf("%s:%s", event.DeliveryID, event.URL)
-	_ = store.MarkProcessed(ctx, eventKey, 5*time.Minute)
+	if err := store.MarkProcessed(ctx, eventKey, 5*time.Minute); err != nil {
+		t.Fatalf("Failed to mark processed: %v", err)
+	}
 
 	// Process event
 	err := coord.processEventSync(ctx, event)
@@ -4741,4 +4834,3 @@ func TestCoordinator_processEventSync_NoChannelsForRepo(t *testing.T) {
 		t.Errorf("No messages should be posted when no channels configured, got %d", len(discord.postedMessages))
 	}
 }
-

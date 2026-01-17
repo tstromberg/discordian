@@ -33,6 +33,14 @@ func New(token string) (*Client, error) {
 		return nil, fmt.Errorf("failed to create Discord session: %w", err)
 	}
 
+	// Set required intents
+	// GUILD_PRESENCES is needed to detect user online/offline status
+	// GUILDS, GUILD_MESSAGES, and MESSAGE_CONTENT are needed for normal bot operations
+	session.Identify.Intents = discordgo.IntentsGuilds |
+		discordgo.IntentsGuildMessages |
+		discordgo.IntentsGuildPresences |
+		discordgo.IntentsMessageContent
+
 	return &Client{
 		session:          session,
 		channelCache:     make(map[string]string),
@@ -417,66 +425,70 @@ func (c *Client) LookupUserByUsername(ctx context.Context, username string) stri
 
 	// Tier 1: Exact match (Username takes precedence over GlobalName)
 	for _, member := range members {
-		if member.User.Username == username {
-			c.mu.Lock()
-			c.userCache[username] = member.User.ID
-			c.mu.Unlock()
-
-			slog.Debug("found user by exact username match",
-				"username", username,
-				"user_id", member.User.ID,
-				"discord_username", member.User.Username,
-				"discord_global_name", member.User.GlobalName)
-
-			return member.User.ID
+		if member.User.Username != username {
+			continue
 		}
+		c.mu.Lock()
+		c.userCache[username] = member.User.ID
+		c.mu.Unlock()
+
+		slog.Debug("found user by exact username match",
+			"username", username,
+			"user_id", member.User.ID,
+			"discord_username", member.User.Username,
+			"discord_global_name", member.User.GlobalName)
+
+		return member.User.ID
 	}
 	for _, member := range members {
-		if member.User.GlobalName == username {
-			c.mu.Lock()
-			c.userCache[username] = member.User.ID
-			c.mu.Unlock()
-
-			slog.Debug("found user by exact global name match",
-				"username", username,
-				"user_id", member.User.ID,
-				"discord_username", member.User.Username,
-				"discord_global_name", member.User.GlobalName)
-
-			return member.User.ID
+		if member.User.GlobalName != username {
+			continue
 		}
+		c.mu.Lock()
+		c.userCache[username] = member.User.ID
+		c.mu.Unlock()
+
+		slog.Debug("found user by exact global name match",
+			"username", username,
+			"user_id", member.User.ID,
+			"discord_username", member.User.Username,
+			"discord_global_name", member.User.GlobalName)
+
+		return member.User.ID
 	}
 
 	// Tier 2: Case-insensitive match (Username takes precedence over GlobalName)
 	for _, member := range members {
-		if strings.EqualFold(member.User.Username, username) {
-			c.mu.Lock()
-			c.userCache[username] = member.User.ID
-			c.mu.Unlock()
-
-			slog.Info("found user by case-insensitive username match",
-				"username", username,
-				"user_id", member.User.ID,
-				"discord_username", member.User.Username,
-				"discord_global_name", member.User.GlobalName)
-
-			return member.User.ID
+		if !strings.EqualFold(member.User.Username, username) {
+			continue
 		}
+		c.mu.Lock()
+		c.userCache[username] = member.User.ID
+		c.mu.Unlock()
+
+		slog.Info("found user by case-insensitive username match",
+			"username", username,
+			"user_id", member.User.ID,
+			"discord_username", member.User.Username,
+			"discord_global_name", member.User.GlobalName)
+
+		return member.User.ID
 	}
 	for _, member := range members {
-		if strings.EqualFold(member.User.GlobalName, username) {
-			c.mu.Lock()
-			c.userCache[username] = member.User.ID
-			c.mu.Unlock()
-
-			slog.Info("found user by case-insensitive global name match",
-				"username", username,
-				"user_id", member.User.ID,
-				"discord_username", member.User.Username,
-				"discord_global_name", member.User.GlobalName)
-
-			return member.User.ID
+		if !strings.EqualFold(member.User.GlobalName, username) {
+			continue
 		}
+		c.mu.Lock()
+		c.userCache[username] = member.User.ID
+		c.mu.Unlock()
+
+		slog.Info("found user by case-insensitive global name match",
+			"username", username,
+			"user_id", member.User.ID,
+			"discord_username", member.User.Username,
+			"discord_global_name", member.User.GlobalName)
+
+		return member.User.ID
 	}
 
 	lowerUsername := strings.ToLower(username)
@@ -874,7 +886,7 @@ func (c *Client) MessageContent(ctx context.Context, channelID, messageID string
 
 // isAllDigits returns true if the string is non-empty and contains only digit characters.
 func isAllDigits(s string) bool {
-	if len(s) == 0 {
+	if s == "" {
 		return false
 	}
 	for _, r := range s {

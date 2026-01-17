@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -550,4 +551,272 @@ func TestFormatChannelMappingsEmbed(t *testing.T) {
 			t.Errorf("Field name should contain '3 repos', got %q", field.Name)
 		}
 	})
+}
+
+func TestSlashCommandHandler_SetDailyReportGetter(t *testing.T) {
+	handler := NewSlashCommandHandler(nil, nil)
+
+	if handler.dailyReportGetter != nil {
+		t.Error("dailyReportGetter should be nil initially")
+	}
+
+	getter := &mockDailyReportGetter{}
+	handler.SetDailyReportGetter(getter)
+
+	if handler.dailyReportGetter == nil {
+		t.Error("SetDailyReportGetter() should set the dailyReportGetter")
+	}
+}
+
+func TestSlashCommandHandler_SetUserMapGetter(t *testing.T) {
+	handler := NewSlashCommandHandler(nil, nil)
+
+	if handler.userMapGetter != nil {
+		t.Error("userMapGetter should be nil initially")
+	}
+
+	getter := &mockUserMapGetter{}
+	handler.SetUserMapGetter(getter)
+
+	if handler.userMapGetter == nil {
+		t.Error("SetUserMapGetter() should set the userMapGetter")
+	}
+}
+
+func TestSlashCommandHandler_SetChannelMapGetter(t *testing.T) {
+	handler := NewSlashCommandHandler(nil, nil)
+
+	if handler.channelMapGetter != nil {
+		t.Error("channelMapGetter should be nil initially")
+	}
+
+	getter := &mockChannelMapGetter{}
+	handler.SetChannelMapGetter(getter)
+
+	if handler.channelMapGetter == nil {
+		t.Error("SetChannelMapGetter() should set the channelMapGetter")
+	}
+}
+
+func TestFormatDailyReportEmbed(t *testing.T) {
+	handler := &SlashCommandHandler{}
+
+	t.Run("report sent successfully", func(t *testing.T) {
+		debug := &DailyReportDebug{
+			UserOnline:         true,
+			LastSentAt:         time.Now().Add(-10 * time.Hour),
+			NextEligibleAt:     time.Now().Add(10 * time.Hour),
+			HoursSinceLastSent: 10.5,
+			Eligible:           true,
+			Reason:             "Report sent successfully",
+			IncomingPRCount:    5,
+			OutgoingPRCount:    3,
+			ReportSent:         true,
+		}
+
+		embed := handler.formatDailyReportEmbed(debug)
+
+		// Should be green when report was sent
+		if embed.Color != 0x57F287 {
+			t.Errorf("Color = %x, want Discord green 0x57F287 (sent)", embed.Color)
+		}
+
+		if embed.Title != "📊 Daily Report Status" {
+			t.Errorf("Title = %q, want '📊 Daily Report Status'", embed.Title)
+		}
+
+		// Should have all expected fields
+		expectedFieldCount := 7 // User Status, PRs Found, Last Sent, Next Eligible, Last Active, Hours Since, Status
+		if len(embed.Fields) != expectedFieldCount {
+			t.Errorf("Fields = %d, want %d", len(embed.Fields), expectedFieldCount)
+		}
+
+		// Check User Status field
+		hasUserStatus := false
+		for _, field := range embed.Fields {
+			if field.Name == "User Status" {
+				hasUserStatus = true
+				if !strings.Contains(field.Value, "🟢 Online") {
+					t.Errorf("User Status should show online, got: %s", field.Value)
+				}
+			}
+		}
+		if !hasUserStatus {
+			t.Error("Should have User Status field")
+		}
+
+		// Check PRs Found field
+		hasPRsFound := false
+		for _, field := range embed.Fields {
+			if field.Name == "PRs Found" {
+				hasPRsFound = true
+				if !strings.Contains(field.Value, "📥 5 incoming") {
+					t.Errorf("PRs Found should show 5 incoming, got: %s", field.Value)
+				}
+				if !strings.Contains(field.Value, "📤 3 outgoing") {
+					t.Errorf("PRs Found should show 3 outgoing, got: %s", field.Value)
+				}
+			}
+		}
+		if !hasPRsFound {
+			t.Error("Should have PRs Found field")
+		}
+
+		// Check Status field
+		hasStatus := false
+		for _, field := range embed.Fields {
+			if field.Name == "Status" {
+				hasStatus = true
+				if !strings.Contains(field.Value, "✅") {
+					t.Error("Status should show success checkmark")
+				}
+				if !strings.Contains(field.Value, "Report sent successfully") {
+					t.Errorf("Status should show reason, got: %s", field.Value)
+				}
+			}
+		}
+		if !hasStatus {
+			t.Error("Should have Status field")
+		}
+	})
+
+	t.Run("report not sent - rate limited", func(t *testing.T) {
+		debug := &DailyReportDebug{
+			UserOnline:         true,
+			LastSentAt:         time.Now().Add(-5 * time.Hour),
+			NextEligibleAt:     time.Now().Add(15 * time.Hour),
+			HoursSinceLastSent: 5.0,
+			Eligible:           false,
+			Reason:             "Rate limited: only 5.0 hours since last report (need 20)",
+			IncomingPRCount:    2,
+			OutgoingPRCount:    1,
+			ReportSent:         false,
+		}
+
+		embed := handler.formatDailyReportEmbed(debug)
+
+		// Should be red when not eligible
+		if embed.Color != 0xED4245 {
+			t.Errorf("Color = %x, want Discord red 0xED4245 (not eligible)", embed.Color)
+		}
+
+		// Check Status field shows not sent
+		hasStatus := false
+		for _, field := range embed.Fields {
+			if field.Name == "Status" {
+				hasStatus = true
+				if !strings.Contains(field.Value, "❌") {
+					t.Error("Status should show error X")
+				}
+				if !strings.Contains(field.Value, "Not sent") {
+					t.Error("Status should show 'Not sent'")
+				}
+				if !strings.Contains(field.Value, "Rate limited") {
+					t.Errorf("Status should show rate limit reason, got: %s", field.Value)
+				}
+			}
+		}
+		if !hasStatus {
+			t.Error("Should have Status field")
+		}
+	})
+
+	t.Run("eligible but not sent", func(t *testing.T) {
+		debug := &DailyReportDebug{
+			UserOnline:         true,
+			LastSentAt:         time.Now().Add(-25 * time.Hour),
+			NextEligibleAt:     time.Now().Add(-5 * time.Hour),
+			HoursSinceLastSent: 25.0,
+			Eligible:           true,
+			Reason:             "Test reason",
+			IncomingPRCount:    0,
+			OutgoingPRCount:    0,
+			ReportSent:         false,
+		}
+
+		embed := handler.formatDailyReportEmbed(debug)
+
+		// Should be yellow when eligible but not sent
+		if embed.Color != 0xFEE75C {
+			t.Errorf("Color = %x, want Discord yellow 0xFEE75C (eligible)", embed.Color)
+		}
+	})
+
+	t.Run("user offline", func(t *testing.T) {
+		debug := &DailyReportDebug{
+			UserOnline:         false,
+			LastSentAt:         time.Time{}, // Never sent
+			HoursSinceLastSent: 0,
+			Eligible:           false,
+			Reason:             "User is offline",
+			IncomingPRCount:    1,
+			OutgoingPRCount:    0,
+			ReportSent:         false,
+		}
+
+		embed := handler.formatDailyReportEmbed(debug)
+
+		// Check User Status field shows offline
+		hasUserStatus := false
+		for _, field := range embed.Fields {
+			if field.Name == "User Status" {
+				hasUserStatus = true
+				if !strings.Contains(field.Value, "🔴 Offline") {
+					t.Errorf("User Status should show offline, got: %s", field.Value)
+				}
+			}
+		}
+		if !hasUserStatus {
+			t.Error("Should have User Status field")
+		}
+
+		// Check Last Sent shows "Never"
+		hasLastSent := false
+		for _, field := range embed.Fields {
+			if field.Name == "Last Report Sent" {
+				hasLastSent = true
+				if !strings.Contains(field.Value, "Never") {
+					t.Errorf("Last Sent should show 'Never', got: %s", field.Value)
+				}
+			}
+		}
+		if !hasLastSent {
+			t.Error("Should have Last Report Sent field")
+		}
+	})
+}
+
+// Mock implementations for testing
+
+type mockDailyReportGetter struct {
+	debug *DailyReportDebug
+	err   error
+}
+
+func (m *mockDailyReportGetter) DailyReport(_ context.Context, _, _ string, _ bool) (*DailyReportDebug, error) {
+	return m.debug, m.err
+}
+
+type mockUserMapGetter struct {
+	mappings *UserMappings
+	err      error
+}
+
+func (m *mockUserMapGetter) UserMappings(_ context.Context, _ string) (*UserMappings, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.mappings, nil
+}
+
+type mockChannelMapGetter struct {
+	mappings *ChannelMappings
+	err      error
+}
+
+func (m *mockChannelMapGetter) ChannelMappings(_ context.Context, _ string) (*ChannelMappings, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.mappings, nil
 }

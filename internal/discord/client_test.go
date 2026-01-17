@@ -248,3 +248,61 @@ func TestFindUserInMembers(t *testing.T) {
 		})
 	}
 }
+
+// TestClient_SetGuildID tests setting the guild ID.
+func TestClient_SetGuildID(t *testing.T) {
+	client := &Client{}
+
+	client.SetGuildID("test-guild-123")
+
+	if client.guildID != "test-guild-123" {
+		t.Errorf("SetGuildID() guildID = %q, want %q", client.guildID, "test-guild-123")
+	}
+}
+
+// TestClient_GuildID tests getting the guild ID.
+func TestClient_GuildID(t *testing.T) {
+	client := &Client{guildID: "test-guild-456"}
+
+	got := client.GuildID()
+	if got != "test-guild-456" {
+		t.Errorf("GuildID() = %q, want %q", got, "test-guild-456")
+	}
+}
+
+// TestClient_Session tests getting the session.
+func TestClient_Session(t *testing.T) {
+	mockSession := &discordgo.Session{}
+	client := &Client{session: mockSession}
+
+	got := client.Session()
+	if got != mockSession {
+		t.Error("Session() should return the same session")
+	}
+}
+
+// TestIsAllDigits tests the isAllDigits helper function.
+func TestIsAllDigits(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{"all digits", "123456", true},
+		{"has letters", "123abc", false},
+		{"has spaces", "123 456", false},
+		{"has special chars", "123-456", false},
+		{"empty string", "", false}, // Empty string is not all digits
+		{"single digit", "5", true},
+		{"single letter", "a", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isAllDigits(tt.input)
+			if got != tt.want {
+				t.Errorf("isAllDigits(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}

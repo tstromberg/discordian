@@ -598,4 +598,3 @@ func TestFidoStore_ClaimDM(t *testing.T) {
 		t.Error("ClaimDM() should succeed after lock expiry")
 	}
 }
-

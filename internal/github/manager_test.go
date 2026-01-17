@@ -2,6 +2,8 @@ package github
 
 import (
 	"testing"
+
+	"github.com/google/go-github/v50/github"
 )
 
 // TestManager_AllOrgs tests retrieving all organizations.
@@ -80,5 +82,26 @@ func TestManager_AppClient(t *testing.T) {
 	returnedClient := manager.AppClient()
 	if returnedClient != appClient {
 		t.Error("AppClient() should return the same client")
+	}
+}
+
+// TestOrgClient_Org tests the Org getter.
+func TestOrgClient_Org(t *testing.T) {
+	orgClient := &OrgClient{org: "testorg"}
+
+	got := orgClient.Org()
+	if got != "testorg" {
+		t.Errorf("Org() = %q, want %q", got, "testorg")
+	}
+}
+
+// TestOrgClient_Client tests the Client getter.
+func TestOrgClient_Client(t *testing.T) {
+	mockClient := &github.Client{}
+	orgClient := &OrgClient{client: mockClient}
+
+	got := orgClient.Client()
+	if got != mockClient {
+		t.Error("Client() should return the same client")
 	}
 }
